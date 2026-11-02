@@ -24,6 +24,18 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum AgentChoice {
+    Own,
+    Mine,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PlanChoice {
+    Chatgpt,
+    Claude,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Sign in to Toolscaled in the browser.
@@ -34,8 +46,23 @@ enum Command {
     },
     /// A guided setup, from nothing to a running watcher: Hermes, the model
     /// login, the sign-in, the token warning, the check, and how to keep it
-    /// running. Each step checks the machine first.
-    Setup,
+    /// running. Each step checks the machine first. With no terminal (a chat
+    /// that runs it for the person), give the answers as flags.
+    Setup {
+        /// Yes to each "Run it now?" question; the defaults for the choices
+        /// that no flag and no config make.
+        #[arg(long)]
+        yes: bool,
+        /// Which Hermes runs the agents: octotrigger's own (default) or mine.
+        #[arg(long, value_enum)]
+        agent: Option<AgentChoice>,
+        /// Which plan pays for the model: chatgpt (default) or claude.
+        #[arg(long, value_enum)]
+        plan: Option<PlanChoice>,
+        /// The person read the token warning and confirms it.
+        #[arg(long)]
+        accept_token_warning: bool,
+    },
     /// Check the sign-in, the claim call, and each job's agent: one short
     /// task that reads the workspace in Toolscaled.
     Check {
@@ -66,9 +93,28 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = cli.config.unwrap_or_else(config::default_path);
     match cli.command {
-        Command::Setup => {
-            setup::need_terminal()?;
-            let finished = setup::run(&mut Terminal, &paths(path)?)?;
+        Command::Setup {
+            yes,
+            agent,
+            plan,
+            accept_token_warning,
+        } => {
+            if !yes {
+                setup::need_terminal()?;
+            }
+            let choices = setup::Choices {
+                yes,
+                agent: agent.map(|choice| match choice {
+                    AgentChoice::Own => config::Agent::Own,
+                    AgentChoice::Mine => config::Agent::Mine,
+                }),
+                plan: plan.map(|choice| match choice {
+                    PlanChoice::Chatgpt => config::Plan::ChatGpt,
+                    PlanChoice::Claude => config::Plan::Claude,
+                }),
+                accept_token_warning,
+            };
+            let finished = setup::run(&mut Terminal, &paths(path)?, choices)?;
             if !finished {
                 std::process::exit(1);
             }
@@ -83,8 +129,11 @@ fn main() -> Result<()> {
                 !no_browser,
             )?;
             println!(
-                "Signed in: workspace {}, scope {}.",
-                tokens.organization_id, tokens.scope
+                "Signed in: workspace {id}, scope {scope}. Its page {base}/org/{id}/workflows \
+                 shows its name.",
+                id = tokens.organization_id,
+                scope = tokens.scope,
+                base = config.base_url.trim_end_matches('/'),
             );
             Ok(())
         }

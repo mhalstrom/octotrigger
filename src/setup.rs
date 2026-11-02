@@ -217,15 +217,29 @@ enum Step {
     Stop,
 }
 
+/// What the person decided before the setup, for a run with no terminal
+/// (a chat that runs the commands for the person, #4165).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Choices {
+    /// Yes to each "Run it now?" and "Write ...?" question, and the default
+    /// of each choice that the flags and the config leave open.
+    pub yes: bool,
+    pub agent: Option<Agent>,
+    pub plan: Option<Plan>,
+    /// The person read the token warning and confirms it.
+    pub accept_token_warning: bool,
+}
+
 /// The guided setup; whether it got to the end.
 ///
 /// # Errors
 ///
 /// A file that cannot be written.
-pub fn run(machine: &mut impl Machine, paths: &Paths) -> Result<bool> {
+pub fn run(machine: &mut impl Machine, paths: &Paths, choices: Choices) -> Result<bool> {
     Setup {
         m: machine,
         p: paths,
+        c: choices,
     }
     .go()
 }
@@ -242,6 +256,7 @@ pub fn uninstall(machine: &mut impl Machine, paths: &Paths, all: bool) -> Result
     Setup {
         m: machine,
         p: paths,
+        c: Choices::default(),
     }
     .uninstall(all)
 }
@@ -249,6 +264,7 @@ pub fn uninstall(machine: &mut impl Machine, paths: &Paths, all: bool) -> Result
 struct Setup<'a, M: Machine> {
     m: &'a mut M,
     p: &'a Paths,
+    c: Choices,
 }
 
 const STEPS: usize = 8;
@@ -302,6 +318,10 @@ impl<M: Machine> Setup<'_, M> {
     }
 
     fn yes(&mut self, question: &str, default_yes: bool) -> bool {
+        if self.c.yes {
+            self.m.say(&format!("  {question} yes (--yes)"));
+            return true;
+        }
         let answer = self
             .m
             .ask(&format!(
@@ -352,8 +372,11 @@ impl<M: Machine> Setup<'_, M> {
                 .iter()
                 .find_map(|job| Agent::of_job(job, &self.p.own))
         });
-        if let Some(agent) = from_config {
+        if let Some(agent) = from_config.or(self.c.agent) {
             return agent;
+        }
+        if self.c.yes {
+            return Agent::Own;
         }
         self.m.say("Which Hermes Agent runs your agents?");
         self.m.say(&format!(
@@ -438,7 +461,9 @@ impl<M: Machine> Setup<'_, M> {
         }
         self.m.say(
             "  Hermes' own installer, at the commit tested with Toolscaled, into this one \
-             folder. It takes about 2 GB and a few minutes.",
+             folder. It takes about 2 GB and a few minutes. Its last line asks you to reload \
+             your shell (`source ~/.zshrc`): that is not for this Hermes, which octotrigger \
+             calls by its path. Setup goes on by itself.",
         );
         let command = own_install_command(&self.p.own);
         self.fix(
@@ -512,8 +537,11 @@ impl<M: Machine> Setup<'_, M> {
                 .iter()
                 .find_map(|job| Plan::of_command(&job.agent))
         });
-        if let Some(plan) = from_config {
+        if let Some(plan) = from_config.or(self.c.plan) {
             return plan;
+        }
+        if self.c.yes {
+            return Plan::ChatGpt;
         }
         self.m.say("Which plan pays for the agent's model?");
         self.m
@@ -647,6 +675,7 @@ impl<M: Machine> Setup<'_, M> {
     fn sign_in(&mut self, toolscaled: &Toolscaled) -> Step {
         self.title(5, "octotrigger's sign-in to Toolscaled");
         let file = expand(&toolscaled.auth_file);
+        let login = self.octotrigger("login");
         let signed_in = |file: &Path| {
             auth::load(file)
                 .ok()
@@ -654,7 +683,15 @@ impl<M: Machine> Setup<'_, M> {
                     tokens.scope.split_whitespace().any(|s| s == MCP_SCOPE)
                         && tokens.resource == toolscaled.mcp_url
                 })
-                .map(|tokens| format!("signed in to workspace {}.", tokens.organization_id))
+                .map(|tokens| {
+                    format!(
+                        "signed in to workspace {id}: its page {base}/org/{id}/workflows shows \
+                         its name. To use another workspace, sign in again: {login}",
+                        id = tokens.organization_id,
+                        login = login,
+                        base = toolscaled.base_url.trim_end_matches('/'),
+                    )
+                })
         };
         if let Some(text) = signed_in(&file) {
             return self.done(&text);
@@ -664,10 +701,9 @@ impl<M: Machine> Setup<'_, M> {
              one sign-in also serves the agents: before each run, octotrigger gives the agent \
              a fresh Toolscaled token.",
         );
-        let command = self.octotrigger("login");
         self.fix(
             "octotrigger is not signed in to Toolscaled.",
-            &command,
+            &login,
             |_| signed_in(&file),
         )
     }
@@ -691,6 +727,18 @@ impl<M: Machine> Setup<'_, M> {
             return Ok(self.done(&format!("you confirmed it on {day}.")));
         }
         self.m.say(&format!("\n{TOKEN_WARNING}\n"));
+        if self.c.accept_token_warning {
+            self.m.say("  Confirmed with --accept-token-warning.");
+            confirm_warning(&self.p.config, &today())?;
+            return Ok(self.done("confirmed."));
+        }
+        if self.c.yes {
+            self.m.say(
+                "  Not confirmed: --yes does not confirm it. When the person has read it, \
+                 run setup again with --accept-token-warning.",
+            );
+            return Ok(Step::Stop);
+        }
         if self.m.ask("  Type yes to confirm that you read this:") != "yes" {
             self.m
                 .say("  Not confirmed: octotrigger starts no agent until you confirm it.");
@@ -1138,7 +1186,11 @@ pub fn systemd_unit(exe: &str, config: &Path, path_env: &str) -> String {
 pub fn need_terminal() -> Result<()> {
     // SAFETY: isatty reads the state of descriptor 0.
     if unsafe { libc::isatty(0) } == 0 {
-        bail!("this command asks questions: run it in a terminal");
+        bail!(
+            "this command asks questions: run it in a terminal, or give the answers as flags \
+             (octotrigger setup --yes [--agent own|mine] [--plan chatgpt|claude] \
+             [--accept-token-warning])"
+        );
     }
     Ok(())
 }
@@ -1377,7 +1429,7 @@ mod tests {
         // check, the launchd file, its start. Hermes and the plan come from
         // the config, so setup asks neither.
         let mut fake = Fake::new(&paths, auth_file.clone(), &["", "", "", "yes", "", "", ""]);
-        let finished = run(&mut fake, &paths).expect("setup");
+        let finished = run(&mut fake, &paths, Choices::default()).expect("setup");
         let said = fake.said.join("\n");
         assert!(finished, "{said}");
         let ran = fake.ran.borrow().clone();
@@ -1421,7 +1473,7 @@ mod tests {
         let mut again = Fake::new(&paths, auth_file, &[""]);
         *again.ran.borrow_mut() = ran;
         let before = again.ran.borrow().len();
-        assert!(run(&mut again, &paths).expect("setup"));
+        assert!(run(&mut again, &paths, Choices::default()).expect("setup"));
         let ran = again.ran.borrow().clone();
         assert_eq!(ran.len(), before + 1, "{ran:?}");
         assert!(ran.last().expect("ran").ends_with(" check"));
@@ -1459,7 +1511,7 @@ mod tests {
         std::fs::remove_file(&paths.config).expect("no config");
         // octotrigger's own Hermes, then no to the install.
         let mut fake = Fake::new(&paths, auth_file, &["", "n"]);
-        assert!(!run(&mut fake, &paths).expect("setup"));
+        assert!(!run(&mut fake, &paths, Choices::default()).expect("setup"));
         let said = fake.said.join("\n");
         assert!(
             said.contains("Which Hermes Agent runs your agents?"),
@@ -1482,13 +1534,74 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_with_no_terminal_drives_setup_with_flags() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (paths, auth_file) = test_paths(dir.path());
+        // --yes alone stops at the token warning: only the person confirms it.
+        let mut fake = Fake::new(&paths, auth_file.clone(), &[]);
+        let yes = Choices {
+            yes: true,
+            ..Choices::default()
+        };
+        assert!(!run(&mut fake, &paths, yes).expect("setup"));
+        let said = fake.said.join("\n");
+        assert!(
+            !said.lines().any(|line| line.starts_with("? ")),
+            "no question is asked: {said}"
+        );
+        assert!(said.contains("Run it now? yes (--yes)"), "{said}");
+        assert!(
+            said.contains("run setup again with --accept-token-warning"),
+            "{said}"
+        );
+        assert!(
+            said.contains("/org/org-1/workflows shows its name"),
+            "{said}"
+        );
+        assert!(
+            said.contains("that is not for this Hermes, which octotrigger calls by its path"),
+            "{said}"
+        );
+        assert!(
+            Config::load(&paths.config)
+                .expect("config")
+                .token_warning_confirmed
+                .is_none()
+        );
+        // With the person's confirmation it goes to the end.
+        let mut again = Fake::new(&paths, auth_file, &[]);
+        *again.ran.borrow_mut() = fake.ran.borrow().clone();
+        let confirmed = Choices {
+            yes: true,
+            accept_token_warning: true,
+            ..Choices::default()
+        };
+        assert!(run(&mut again, &paths, confirmed).expect("setup"));
+        let said = again.said.join("\n");
+        assert!(
+            !said.lines().any(|line| line.starts_with("? ")),
+            "no question is asked: {said}"
+        );
+        assert!(
+            said.contains("Confirmed with --accept-token-warning."),
+            "{said}"
+        );
+        assert!(
+            Config::load(&paths.config)
+                .expect("config")
+                .token_warning_confirmed
+                .is_some()
+        );
+    }
+
+    #[test]
     fn a_persons_own_hermes_is_used_as_it_is() {
         let dir = tempfile::tempdir().expect("dir");
         let (paths, auth_file) = test_paths(dir.path());
         std::fs::remove_file(&paths.config).expect("no config");
         // My own Hermes, then no to its install.
         let mut fake = Fake::new(&paths, auth_file, &["2", "n"]);
-        assert!(!run(&mut fake, &paths).expect("setup"));
+        assert!(!run(&mut fake, &paths, Choices::default()).expect("setup"));
         let said = fake.said.join("\n");
         assert!(said.contains(&format!("Run: {HERMES_INSTALL}")), "{said}");
         assert!(
