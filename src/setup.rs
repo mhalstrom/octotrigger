@@ -1,4 +1,5 @@
-//! `octotrigger setup`: a guided setup from nothing to a running watcher.
+//! `octotrigger setup`: a guided setup from nothing to a running watcher, and
+//! `octotrigger uninstall`.
 //!
 //! Each step checks the machine. When the step is done, setup says so and
 //! goes on. When it is not, setup prints the exact command, runs it after
@@ -6,8 +7,15 @@
 //! setup with what to do; the next `octotrigger setup` starts again at the
 //! first step and passes the done ones.
 //!
-//! The steps: Hermes Agent, octotrigger's own Hermes home, the model login
-//! (a ChatGPT plan, or a Claude plan as the second choice), the config,
+//! By default the agents run on octotrigger's own Hermes Agent, installed in
+//! `~/.octotrigger/agents/hermes` with Hermes' own installer at a pinned
+//! commit: no `hermes` command on the PATH, no shell file changed, and the
+//! person's own `~/.hermes` never read or written. Its Toolscaled
+//! connection is octotrigger's sign-in. The second choice, on the person's
+//! pick only, is their own Hermes setup.
+//!
+//! The steps: Hermes (two steps for either choice), the model login (a
+//! ChatGPT plan, or a Claude plan as the second choice), the config,
 //! octotrigger's sign-in to Toolscaled, the token warning, the check, and
 //! how to keep the watcher running.
 
@@ -17,19 +25,26 @@ use anyhow::{Result, bail};
 use serde_json::Value;
 
 use crate::TOKEN_WARNING;
+use crate::agent::alive;
 use crate::auth::{self, MCP_SCOPE};
 use crate::config::{
-    self, AGENT_TOKEN_ENV, CLAUDE_PROVIDER, Config, Plan, Toolscaled, expand, hermes_config,
+    self, AGENT_TOKEN_ENV, Agent, CLAUDE_PROVIDER, Config, OwnHermes, Plan, Toolscaled, expand,
+    hermes_config,
 };
-use crate::state::today;
+use crate::state::{State, today};
 
 /// The oldest Hermes Agent that octotrigger runs.
 pub const HERMES_MIN: (u32, u32, u32) = (0, 21, 4);
-/// Hermes' own install command (its README).
+/// The Hermes commit that octotrigger installs: the one tested with
+/// Toolscaled (Hermes Agent 0.21.7, 2026-09-24).
+pub const HERMES_PIN: &str = "71d34bad1045610252eda02ee79549436896e784";
+/// Hermes' own install command (its README), for a person's own setup.
 pub const HERMES_INSTALL: &str =
     "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash";
 /// The Hermes plugin of the Claude plan route.
 pub const CLAUDE_PLUGIN: &str = "claude-subscription-directsdk";
+/// The label of the launchd file.
+pub const LAUNCHD_LABEL: &str = "com.octotrigger.watcher";
 
 /// What a command printed, and whether it exited 0.
 #[derive(Clone, Debug, Default)]
@@ -131,8 +146,8 @@ impl Machine for Terminal {
 pub struct Paths {
     /// octotrigger's config.
     pub config: PathBuf,
-    /// octotrigger's Hermes home.
-    pub hermes_home: PathBuf,
+    /// octotrigger's own Hermes.
+    pub own: OwnHermes,
     /// The person's home folder (service files).
     pub home: PathBuf,
     /// This program, as the service file and the printed commands name it.
@@ -143,6 +158,58 @@ pub struct Paths {
     pub machine: String,
 }
 
+/// The Hermes that setup works on: its command and its home.
+struct Hermes {
+    program: String,
+    /// `None`: the person's own default home (`~/.hermes`).
+    home: Option<String>,
+}
+
+impl Hermes {
+    fn of(agent: Agent, own: &OwnHermes) -> Self {
+        match agent {
+            Agent::Own => Self {
+                program: own.program().display().to_string(),
+                home: Some(own.home().display().to_string()),
+            },
+            Agent::Mine => Self {
+                program: "hermes".to_owned(),
+                home: None,
+            },
+        }
+    }
+
+    /// The command line of `args`, with this Hermes and its home.
+    fn line(&self, args: &str) -> String {
+        match &self.home {
+            Some(home) => format!(
+                "HERMES_HOME={} {} {args}",
+                shell_quote(home),
+                shell_quote(&self.program)
+            ),
+            None => format!("hermes {args}"),
+        }
+    }
+
+    fn output(&self, m: &impl Machine, args: &[&str]) -> Option<Output> {
+        match &self.home {
+            Some(home) => m.output(&self.program, args, &[("HERMES_HOME", home)]),
+            None => m.output(&self.program, args, &[]),
+        }
+    }
+
+    fn version(&self, m: &impl Machine) -> Option<(u32, u32, u32)> {
+        self.output(m, &["--version"])
+            .filter(|out| out.ok)
+            .and_then(|out| parse_version(&out.text))
+    }
+
+    fn codex_login(&self, m: &impl Machine) -> bool {
+        self.output(m, &["auth", "list"])
+            .is_some_and(|out| out.ok && has_codex_login(&out.text))
+    }
+}
+
 /// How a step ended.
 enum Step {
     Done,
@@ -150,17 +217,33 @@ enum Step {
     Stop,
 }
 
-/// The guided setup.
+/// The guided setup; whether it got to the end.
 ///
 /// # Errors
 ///
 /// A file that cannot be written.
 pub fn run(machine: &mut impl Machine, paths: &Paths) -> Result<bool> {
-    let mut setup = Setup {
+    Setup {
         m: machine,
         p: paths,
-    };
-    setup.go()
+    }
+    .go()
+}
+
+/// `octotrigger uninstall`: stops the watcher's service and removes its
+/// file, removes octotrigger's own Hermes after a yes, and with `all` also
+/// octotrigger's config, sign-in and logs after a second yes. Whether it got
+/// to the end.
+///
+/// # Errors
+///
+/// A file or folder that cannot be removed.
+pub fn uninstall(machine: &mut impl Machine, paths: &Paths, all: bool) -> Result<bool> {
+    Setup {
+        m: machine,
+        p: paths,
+    }
+    .uninstall(all)
 }
 
 struct Setup<'a, M: Machine> {
@@ -174,27 +257,35 @@ impl<M: Machine> Setup<'_, M> {
     fn go(&mut self) -> Result<bool> {
         self.m
             .say("octotrigger setup: each step checks your machine first.\n");
-        if matches!(self.hermes()?, Step::Stop) {
+        let agent = self.agent();
+        let steps = match agent {
+            Agent::Own => {
+                matches!(self.own_home()?, Step::Done) && matches!(self.own_install(), Step::Done)
+            }
+            Agent::Mine => {
+                matches!(self.mine_install(), Step::Done)
+                    && matches!(self.mine_connection(), Step::Done)
+            }
+        };
+        if !steps {
             return Ok(false);
         }
-        if matches!(self.hermes_home()?, Step::Stop) {
-            return Ok(false);
-        }
+        let hermes = Hermes::of(agent, &self.p.own);
         let plan = self.plan();
-        if matches!(self.model_login(plan)?, Step::Stop) {
+        if matches!(self.model_login(plan, &hermes), Step::Stop) {
             return Ok(false);
         }
-        if matches!(self.config(plan)?, Step::Stop) {
+        if matches!(self.config(plan, agent)?, Step::Stop) {
             return Ok(false);
         }
         let config = Config::load(&self.p.config)?;
-        if matches!(self.sign_in(&config.toolscaled)?, Step::Stop) {
+        if matches!(self.sign_in(&config.toolscaled), Step::Stop) {
             return Ok(false);
         }
         if matches!(self.warning(&config)?, Step::Stop) {
             return Ok(false);
         }
-        if matches!(self.check()?, Step::Stop) {
+        if matches!(self.check(), Step::Stop) {
             return Ok(false);
         }
         self.keep_running(&config)?;
@@ -252,57 +343,43 @@ impl<M: Machine> Setup<'_, M> {
         }
     }
 
-    fn hermes_env(&self) -> String {
-        self.p.hermes_home.display().to_string()
-    }
-
-    /// The command line with octotrigger's Hermes home.
-    fn in_home(&self, command: &str) -> String {
-        format!("HERMES_HOME={} {command}", shell_quote(&self.hermes_env()))
-    }
-
-    // 1
-    fn hermes(&mut self) -> Result<Step> {
-        self.title(1, "Hermes Agent, 0.21.4 or newer");
-        match hermes_version(&*self.m) {
-            Some(version) if version >= HERMES_MIN => {
-                Ok(self.done(&format!("Hermes Agent {}.", show_version(version))))
-            }
-            Some(version) => Ok(self.fix(
-                &format!(
-                    "Hermes Agent {} is older than 0.21.4.",
-                    show_version(version)
-                ),
-                "hermes update",
-                |me| {
-                    hermes_version(&*me.m)
-                        .filter(|v| *v >= HERMES_MIN)
-                        .map(|v| format!("Hermes Agent {}.", show_version(v)))
-                },
-            )),
-            None => {
-                let step = self.fix("Hermes Agent is not installed.", HERMES_INSTALL, |me| {
-                    hermes_version(&*me.m)
-                        .filter(|v| *v >= HERMES_MIN)
-                        .map(|v| format!("Hermes Agent {}.", show_version(v)))
-                });
-                if matches!(step, Step::Stop) {
-                    self.m.say(
-                        "  When the install says it is done, open a new terminal, so that \
-                         `hermes` is on your PATH.",
-                    );
-                }
-                Ok(step)
+    /// The choice of Hermes: from the config when it has a Hermes job, else
+    /// the person's pick, octotrigger's own by default.
+    fn agent(&mut self) -> Agent {
+        let from_config = Config::load(&self.p.config).ok().and_then(|config| {
+            config
+                .jobs
+                .iter()
+                .find_map(|job| Agent::of_job(job, &self.p.own))
+        });
+        if let Some(agent) = from_config {
+            return agent;
+        }
+        self.m.say("Which Hermes Agent runs your agents?");
+        self.m.say(&format!(
+            "  1  octotrigger's own, installed in {} (recommended). Your own Hermes, if you \
+             have one, is not read or changed.",
+            home_relative(&self.p.own.root, &self.p.home)
+        ));
+        self.m.say(
+            "  2  My own Hermes setup: the `hermes` on my PATH, with ~/.hermes and its own \
+             Toolscaled connection.",
+        );
+        loop {
+            match self.m.ask("  Type 1 or 2 [1]").as_str() {
+                "" | "1" => return Agent::Own,
+                "2" => return Agent::Mine,
+                _ => {}
             }
         }
     }
 
-    // 2
-    fn hermes_home(&mut self) -> Result<Step> {
-        self.title(2, "octotrigger's own Hermes home");
-        let file = self.p.hermes_home.join("config.yaml");
-        let text = std::fs::read_to_string(&file).ok();
-        match text {
+    // 1, octotrigger's own Hermes. Before the install: the installer keeps
+    // a config it finds, so `cli.expose_on_path: false` holds from the start.
+    fn own_home(&mut self) -> Result<Step> {
+        self.title(1, "octotrigger's own Hermes home");
+        let file = self.p.own.home().join("config.yaml");
+        match std::fs::read_to_string(&file).ok() {
             Some(text) if text.contains(&format!("${{{AGENT_TOKEN_ENV}}}")) => {
                 Ok(self.done(&format!(
                     "{} names Toolscaled on octotrigger's sign-in.",
@@ -316,25 +393,116 @@ impl<M: Machine> Setup<'_, M> {
                 ));
                 self.m.say(&format!(
                     "  Add this to it, then run `octotrigger setup` again:\n\n{}",
-                    hermes_config(&config::Toolscaled::default().mcp_url)
+                    hermes_config(&self.mcp_url()?)
                 ));
                 Ok(Step::Stop)
             }
             None => {
-                let mcp_url = if self.p.config.exists() {
-                    Config::load(&self.p.config)?.toolscaled.mcp_url
-                } else {
-                    config::Toolscaled::default().mcp_url
-                };
-                write_private(&file, &hermes_config(&mcp_url))?;
+                write_private(&file, &hermes_config(&self.mcp_url()?))?;
                 Ok(self.done(&format!(
-                    "wrote {}. The agents octotrigger starts use this Hermes home: \
-                     Toolscaled on octotrigger's sign-in, a model login of their own, \
-                     no memory across runs. Your own Hermes is not changed.",
+                    "wrote {}: Toolscaled on octotrigger's sign-in (a fresh token for each \
+                     run), a model login of its own, no memory across runs, no `hermes` on \
+                     your PATH.",
                     file.display()
                 )))
             }
         }
+    }
+
+    fn mcp_url(&self) -> Result<String> {
+        Ok(if self.p.config.exists() {
+            Config::load(&self.p.config)?.toolscaled.mcp_url
+        } else {
+            Toolscaled::default().mcp_url
+        })
+    }
+
+    // 2, octotrigger's own Hermes.
+    fn own_install(&mut self) -> Step {
+        self.title(2, "octotrigger's own Hermes Agent");
+        let hermes = Hermes::of(Agent::Own, &self.p.own);
+        let ready = |me: &Self| {
+            hermes
+                .version(&*me.m)
+                .filter(|v| *v >= HERMES_MIN)
+                .map(|v| {
+                    format!(
+                        "Hermes Agent {} in {}.",
+                        show_version(v),
+                        home_relative(&me.p.own.root, &me.p.home)
+                    )
+                })
+        };
+        if let Some(text) = ready(self) {
+            return self.done(&text);
+        }
+        self.m.say(
+            "  Hermes' own installer, at the commit tested with Toolscaled, into this one \
+             folder. It takes about 2 GB and a few minutes.",
+        );
+        let command = own_install_command(&self.p.own);
+        self.fix(
+            "octotrigger's own Hermes Agent is not installed.",
+            &command,
+            ready,
+        )
+    }
+
+    // 1, the person's own Hermes.
+    fn mine_install(&mut self) -> Step {
+        self.title(1, "Your Hermes Agent, 0.21.4 or newer");
+        let hermes = Hermes::of(Agent::Mine, &self.p.own);
+        let ready = |me: &Self| {
+            hermes
+                .version(&*me.m)
+                .filter(|v| *v >= HERMES_MIN)
+                .map(|v| format!("Hermes Agent {}.", show_version(v)))
+        };
+        if let Some(text) = ready(self) {
+            return self.done(&text);
+        }
+        let (not_done, command) = match hermes.version(&*self.m) {
+            Some(v) => (
+                format!("Hermes Agent {} is older than 0.21.4.", show_version(v)),
+                "hermes update",
+            ),
+            None => ("Hermes Agent is not installed.".to_owned(), HERMES_INSTALL),
+        };
+        let step = self.fix(&not_done, command, ready);
+        if matches!(step, Step::Stop) && command == HERMES_INSTALL {
+            self.m.say(
+                "  When the install says it is done, open a new terminal, so that `hermes` is \
+                 on your PATH.",
+            );
+        }
+        step
+    }
+
+    // 2, the person's own Hermes.
+    fn mine_connection(&mut self) -> Step {
+        self.title(2, "Your Hermes' Toolscaled connection");
+        self.m.say(
+            "  The agents use your own Hermes' Toolscaled login. Toolscaled cannot tell their \
+             calls from your own Hermes chats, so a chat of yours during a run is held to the \
+             run's limits.",
+        );
+        let connected = |me: &Self| {
+            me.m.output("hermes", &["mcp", "test", "toolscaled"], &[])
+                .filter(|out| out.ok && out.text.contains("Connected"))
+                .map(|_| "your Hermes connects to Toolscaled.".to_owned())
+        };
+        if let Some(text) = connected(self) {
+            return self.done(&text);
+        }
+        let command = format!(
+            "hermes mcp add toolscaled --url {} --auth oauth",
+            Toolscaled::default().mcp_url
+        );
+        self.fix(
+            "your Hermes has no working Toolscaled server named toolscaled.",
+            &command,
+            connected,
+        )
     }
 
     fn plan(&mut self) -> Plan {
@@ -362,59 +530,56 @@ impl<M: Machine> Setup<'_, M> {
     }
 
     // 3
-    fn model_login(&mut self, plan: Plan) -> Result<Step> {
+    fn model_login(&mut self, plan: Plan, hermes: &Hermes) -> Step {
         match plan {
             Plan::ChatGpt => {
-                self.title(3, "ChatGPT login of octotrigger's Hermes");
-                if codex_login(&*self.m, &self.hermes_env()) {
-                    return Ok(self.done("Hermes has an openai-codex login."));
+                self.title(3, "The ChatGPT login of the agents' Hermes");
+                if hermes.codex_login(&*self.m) {
+                    return self.done("Hermes has an openai-codex login.");
                 }
-                self.m.say(
-                    "  Give octotrigger's Hermes a ChatGPT login of its own: two programs \
-                     on one login can log each other out. Type the code it shows in your browser.",
-                );
-                let command = self.in_home("hermes auth add openai-codex");
-                Ok(
-                    self.fix("Hermes has no openai-codex login.", &command, |me| {
-                        codex_login(&*me.m, &me.hermes_env())
-                            .then(|| "Hermes has an openai-codex login.".to_owned())
-                    }),
-                )
+                if hermes.home.is_some() {
+                    self.m.say(
+                        "  Give octotrigger's Hermes a ChatGPT login of its own: two programs \
+                         on one login can log each other out.",
+                    );
+                }
+                self.m.say("  Type the code it shows in your browser.");
+                let command = hermes.line("auth add openai-codex");
+                self.fix("Hermes has no openai-codex login.", &command, |me| {
+                    hermes
+                        .codex_login(&*me.m)
+                        .then(|| "Hermes has an openai-codex login.".to_owned())
+                })
             }
             Plan::Claude => {
-                self.title(3, "Claude login of octotrigger's Hermes");
-                if !plugin_enabled(&self.p.hermes_home) {
-                    let installed = self
-                        .p
-                        .hermes_home
-                        .join("plugins")
-                        .join(CLAUDE_PROVIDER)
-                        .exists();
+                self.title(3, "The Claude login of the agents' Hermes");
+                let home = hermes
+                    .home
+                    .as_ref()
+                    .map_or_else(|| self.p.home.join(".hermes"), PathBuf::from);
+                if !plugin_enabled(&home) {
+                    let installed = home.join("plugins").join(CLAUDE_PROVIDER).exists();
                     let command = if installed {
-                        self.in_home(&format!("hermes plugins enable {CLAUDE_PROVIDER}"))
+                        hermes.line(&format!("plugins enable {CLAUDE_PROVIDER}"))
                     } else {
-                        self.in_home(&format!("hermes plugins install {CLAUDE_PLUGIN}"))
+                        hermes.line(&format!("plugins install {CLAUDE_PLUGIN}"))
                     };
-                    let step = self.fix(
-                        "octotrigger's Hermes has no Claude plugin.",
-                        &command,
-                        |me| {
-                            plugin_enabled(&me.p.hermes_home)
-                                .then(|| "the Claude plugin is on.".to_owned())
-                        },
-                    );
+                    let step =
+                        self.fix("the agents' Hermes has no Claude plugin.", &command, |_| {
+                            plugin_enabled(&home).then(|| "the Claude plugin is on.".to_owned())
+                        });
                     if matches!(step, Step::Stop) {
-                        return Ok(step);
+                        return step;
                     }
                 }
                 if claude_login(&*self.m) {
-                    return Ok(self.done("Claude Code is signed in with a claude.ai account."));
+                    return self.done("Claude Code is signed in with a claude.ai account.");
                 }
                 self.m.say(
-                    "  Sign in with your claude.ai account. Then turn off extra usage in \
-                     your claude.ai settings, so a run that goes wrong stops at your plan's limit.",
+                    "  Sign in with your claude.ai account. Then turn off extra usage in your \
+                     claude.ai settings, so a run that goes wrong stops at your plan's limit.",
                 );
-                Ok(self.fix(
+                self.fix(
                     "Claude Code is not signed in with a claude.ai account.",
                     "claude auth login",
                     |me| {
@@ -422,16 +587,19 @@ impl<M: Machine> Setup<'_, M> {
                             "Claude Code is signed in with a claude.ai account.".to_owned()
                         })
                     },
-                ))
+                )
             }
         }
     }
 
     // 4
-    fn config(&mut self, plan: Plan) -> Result<Step> {
+    fn config(&mut self, plan: Plan, agent: Agent) -> Result<Step> {
         self.title(4, "octotrigger's config");
         if !self.p.config.exists() {
-            write_private(&self.p.config, &config::starter(&self.p.machine, plan))?;
+            write_private(
+                &self.p.config,
+                &config::starter(&self.p.machine, plan, agent),
+            )?;
             return Ok(self.done(&format!(
                 "wrote {}: one job, {}, one run at once, 20 runs a day. Change it when you like.",
                 self.p.config.display(),
@@ -450,35 +618,33 @@ impl<M: Machine> Setup<'_, M> {
                 return Ok(Step::Stop);
             }
         };
-        let home = self.hermes_env();
-        let missing: Vec<&str> = config
-            .jobs
-            .iter()
-            .filter(|job| job.agent.trim_start().starts_with("hermes"))
-            .filter(|job| {
-                !job.env_values()
-                    .iter()
-                    .any(|(name, value)| name == "HERMES_HOME" && *value == home)
-            })
-            .map(|job| job.name.as_str())
-            .collect();
-        if !missing.is_empty() {
-            self.m.say(&format!(
-                "  Not done: job {} runs Hermes without octotrigger's Hermes home, so the \
-                 agent has no Toolscaled connection.",
-                missing.join(", ")
-            ));
-            self.m.say(&format!(
-                "  Add to each such job, then run `octotrigger setup` again:\n\n    env:\n      HERMES_HOME: {}\n",
-                home_relative(&self.p.hermes_home, &self.p.home)
-            ));
-            return Ok(Step::Stop);
+        if agent == Agent::Own {
+            let missing: Vec<&str> = config
+                .jobs
+                .iter()
+                .filter(|job| Agent::of_job(job, &self.p.own) == Some(Agent::Mine))
+                .map(|job| job.name.as_str())
+                .collect();
+            if !missing.is_empty() {
+                self.m.say(&format!(
+                    "  Not done: job {} runs a Hermes without octotrigger's Hermes home, so the \
+                     agent has no Toolscaled connection.",
+                    missing.join(", ")
+                ));
+                self.m.say(&format!(
+                    "  In each such job, run `{}` with these lines, then run `octotrigger setup` \
+                     again:\n\n    env:\n      HERMES_HOME: {}\n",
+                    home_relative(&self.p.own.program(), &self.p.home),
+                    home_relative(&self.p.own.home(), &self.p.home)
+                ));
+                return Ok(Step::Stop);
+            }
         }
         Ok(self.done(&format!("{} reads and checks.", self.p.config.display())))
     }
 
     // 5
-    fn sign_in(&mut self, toolscaled: &Toolscaled) -> Result<Step> {
+    fn sign_in(&mut self, toolscaled: &Toolscaled) -> Step {
         self.title(5, "octotrigger's sign-in to Toolscaled");
         let file = expand(&toolscaled.auth_file);
         let signed_in = |file: &Path| {
@@ -491,18 +657,19 @@ impl<M: Machine> Setup<'_, M> {
                 .map(|tokens| format!("signed in to workspace {}.", tokens.organization_id))
         };
         if let Some(text) = signed_in(&file) {
-            return Ok(self.done(&text));
+            return self.done(&text);
         }
         self.m.say(
-            "  One sign-in serves octotrigger and its agents: before each run, octotrigger \
-             gives the agent a fresh Toolscaled token. Your browser opens; sign in and approve.",
+            "  Your browser opens; sign in and approve. With octotrigger's own Hermes, this \
+             one sign-in also serves the agents: before each run, octotrigger gives the agent \
+             a fresh Toolscaled token.",
         );
         let command = self.octotrigger("login");
-        Ok(self.fix(
+        self.fix(
             "octotrigger is not signed in to Toolscaled.",
             &command,
             |_| signed_in(&file),
-        ))
+        )
     }
 
     fn octotrigger(&self, command: &str) -> String {
@@ -534,7 +701,7 @@ impl<M: Machine> Setup<'_, M> {
     }
 
     // 7
-    fn check(&mut self) -> Result<Step> {
+    fn check(&mut self) -> Step {
         self.title(7, "The check");
         self.m.say(
             "  It makes one claim call that takes no run, and starts each job's agent once \
@@ -545,39 +712,42 @@ impl<M: Machine> Setup<'_, M> {
         self.m.say(&format!("  Run: {command}"));
         if !self.yes("Run it now?", true) {
             self.m.say("  Run it, then run `octotrigger setup` again.");
-            return Ok(Step::Stop);
+            return Step::Stop;
         }
         if self.m.run(&command) {
-            return Ok(self.done("octotrigger and its agents reach Toolscaled."));
+            return self.done("octotrigger and its agents reach Toolscaled.");
         }
         self.m
             .say("  The check failed. Do what it says, then run `octotrigger setup` again.");
-        Ok(Step::Stop)
+        Step::Stop
     }
 
-    // 8
-    fn keep_running(&mut self, config: &Config) -> Result<()> {
-        self.title(8, "Start the watcher, and keep it running");
-        let log_dir = expand(&config.log_dir);
-        let service = match self.m.os() {
-            Os::MacOs => Some((
-                self.p.home.join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist")),
-                launchd_plist(&self.p.exe, &self.p.config, &self.p.path_env, &log_dir),
-                format!(
-                    "launchctl bootstrap gui/{} {}",
-                    self.m.uid(),
-                    shell_quote(
-                        &self
-                            .p
-                            .home
-                            .join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist"))
-                            .display()
-                            .to_string()
-                    )
-                ),
-                format!("launchctl bootout gui/{}/{LAUNCHD_LABEL}", self.m.uid()),
-                "launchd",
-            )),
+    /// The service file of this machine: its path, its text, the commands
+    /// that start and stop it, and the service manager's name.
+    fn service(&self, config: &Config) -> Option<(PathBuf, String, String, String, &'static str)> {
+        match self.m.os() {
+            Os::MacOs => {
+                let file = self
+                    .p
+                    .home
+                    .join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist"));
+                Some((
+                    file.clone(),
+                    launchd_plist(
+                        &self.p.exe,
+                        &self.p.config,
+                        &self.p.path_env,
+                        &expand(&config.log_dir),
+                    ),
+                    format!(
+                        "launchctl bootstrap gui/{} {}",
+                        self.m.uid(),
+                        shell_quote(&file.display().to_string())
+                    ),
+                    format!("launchctl bootout gui/{}/{LAUNCHD_LABEL}", self.m.uid()),
+                    "launchd",
+                ))
+            }
             Os::Linux => Some((
                 self.p.home.join(".config/systemd/user/octotrigger.service"),
                 systemd_unit(&self.p.exe, &self.p.config, &self.p.path_env),
@@ -587,20 +757,27 @@ impl<M: Machine> Setup<'_, M> {
                 "systemd",
             )),
             Os::Other => None,
-        };
+        }
+    }
+
+    // 8
+    fn keep_running(&mut self, config: &Config) -> Result<()> {
+        self.title(8, "Start the watcher, and keep it running");
         let start = self.octotrigger("start");
-        let Some((file, text, load, unload, name)) = service else {
+        let Some((file, text, load, unload, name)) = self.service(config) else {
             self.m.say(&format!("  Start it: {start}"));
             return Ok(());
         };
         if file.exists() {
             self.done(&format!(
-                "{name} starts octotrigger at login and after a crash ({}). To turn that off: {unload}",
+                "{name} starts octotrigger at login and after a crash ({}). To turn that off: \
+                 {unload}",
                 file.display()
             ));
         } else if self.yes(
             &format!(
-                "Write a {name} file, so that octotrigger starts at login and again after a crash?"
+                "Write a {name} file, so that octotrigger starts at login and again after a \
+                 crash?"
             ),
             true,
         ) {
@@ -616,7 +793,8 @@ impl<M: Machine> Setup<'_, M> {
             }
             if self.m.os() == Os::Linux {
                 self.m.say(
-                    "  To keep it running when you are not signed in: loginctl enable-linger $USER",
+                    "  To keep it running when you are not signed in: loginctl enable-linger \
+                     $USER",
                 );
             }
         } else {
@@ -630,10 +808,124 @@ impl<M: Machine> Setup<'_, M> {
         ));
         Ok(())
     }
+
+    fn uninstall(&mut self, all: bool) -> Result<bool> {
+        let config = Config::load(&self.p.config).ok();
+        if let Some(config) = &config
+            && let Some((file, _, _, unload, name)) = self.service(config)
+            && file.exists()
+        {
+            self.m.say(&format!("Stop {name}'s octotrigger: {unload}"));
+            self.m.run(&unload);
+            std::fs::remove_file(&file)?;
+            self.m.say(&format!("Removed {}.", file.display()));
+        }
+        if let Some(config) = &config {
+            let state = State::load(&expand(&config.state_file)).unwrap_or_default();
+            if let Some(pid) = state.loop_pid.filter(|pid| alive(*pid)) {
+                self.m.say(&format!(
+                    "octotrigger still runs (process {pid}). Run `{}` first, then uninstall \
+                     again.",
+                    self.octotrigger("stop --now")
+                ));
+                return Ok(false);
+            }
+        }
+        let root = &self.p.own.root;
+        if root.exists() {
+            if self.yes(
+                &format!(
+                    "Remove {} (octotrigger's own Hermes, its model login and its history, \
+                     about 2 GB)?",
+                    root.display()
+                ),
+                false,
+            ) {
+                std::fs::remove_dir_all(root)?;
+                // The folders above it, when they hold nothing else.
+                for folder in root.ancestors().skip(1).take(2) {
+                    if folder.starts_with(&self.p.home) && folder != self.p.home {
+                        let _ = std::fs::remove_dir(folder);
+                    }
+                }
+                self.m.say(&format!("Removed {}.", root.display()));
+            } else {
+                self.m.say(&format!("Kept {}.", root.display()));
+            }
+        }
+        if all {
+            let mut folders: Vec<PathBuf> = Vec::new();
+            let mut add = |path: PathBuf| {
+                // Only folders of octotrigger's own, never a folder such as ~.
+                if path.components().any(|c| c.as_os_str() == "octotrigger")
+                    && path.exists()
+                    && !folders.iter().any(|f| path.starts_with(f))
+                {
+                    folders.retain(|f| !f.starts_with(&path));
+                    folders.push(path);
+                }
+            };
+            if let Some(folder) = self.p.config.parent() {
+                add(folder.to_path_buf());
+            }
+            let config = config.unwrap_or_else(|| {
+                serde_yaml::from_str(&config::starter("m", Plan::ChatGpt, Agent::Own))
+                    .expect("the starter config reads")
+            });
+            for path in [
+                expand(&config.toolscaled.auth_file),
+                expand(&config.state_file),
+                expand(&config.stop_file),
+            ] {
+                if let Some(folder) = path.parent() {
+                    add(folder.to_path_buf());
+                }
+            }
+            add(expand(&config.log_dir));
+            add(expand(&config.work_dir));
+            if !folders.is_empty() {
+                let names: Vec<String> = folders.iter().map(|f| f.display().to_string()).collect();
+                if self.yes(
+                    &format!(
+                        "Also remove octotrigger's config, sign-in and logs ({})?",
+                        names.join(", ")
+                    ),
+                    false,
+                ) {
+                    for folder in &folders {
+                        std::fs::remove_dir_all(folder)?;
+                    }
+                    self.m.say(&format!("Removed {}.", names.join(", ")));
+                    self.m.say(
+                        "The sign-in ends on Toolscaled's side by itself; you can also revoke it \
+                         on the website.",
+                    );
+                }
+            }
+        }
+        self.m
+            .say("To remove the program itself: cargo uninstall octotrigger");
+        Ok(true)
+    }
 }
 
-/// The label of the launchd file.
-pub const LAUNCHD_LABEL: &str = "com.octotrigger.watcher";
+/// The command that installs octotrigger's own Hermes: Hermes' installer at
+/// the pinned commit, its code and home in the one folder, its `HOME` there
+/// too (its shell lines go to that folder, not to the person's shell files),
+/// with no setup questions, no browser tools and no computer-use driver.
+#[must_use]
+pub fn own_install_command(own: &OwnHermes) -> String {
+    let q = |path: PathBuf| shell_quote(&path.display().to_string());
+    format!(
+        "mkdir -p {installer_home} && curl -fsSL \
+         https://raw.githubusercontent.com/NousResearch/hermes-agent/{HERMES_PIN}/scripts/install.sh \
+         | HOME={installer_home} bash -s -- --dir {code} --hermes-home {home} \
+         --commit {HERMES_PIN} --non-interactive --skip-browser --skip-computer-use",
+        installer_home = q(own.installer_home()),
+        code = q(own.code()),
+        home = q(own.home()),
+    )
+}
 
 /// Hermes' version from `hermes --version`: the first `x.y.z` of its first
 /// line ("Hermes Agent v0.21.6+777.g71d34ba (2026.9.24) · stable").
@@ -654,12 +946,6 @@ fn show_version((major, minor, patch): (u32, u32, u32)) -> String {
     format!("{major}.{minor}.{patch}")
 }
 
-fn hermes_version(m: &impl Machine) -> Option<(u32, u32, u32)> {
-    m.output("hermes", &["--version"], &[])
-        .filter(|out| out.ok)
-        .and_then(|out| parse_version(&out.text))
-}
-
 /// Whether `hermes auth list` shows an `openai-codex` login of kind oauth.
 #[must_use]
 pub fn has_codex_login(text: &str) -> bool {
@@ -672,11 +958,6 @@ pub fn has_codex_login(text: &str) -> bool {
         }
     }
     false
-}
-
-fn codex_login(m: &impl Machine, home: &str) -> bool {
-    m.output("hermes", &["auth", "list"], &[("HERMES_HOME", home)])
-        .is_some_and(|out| out.ok && has_codex_login(&out.text))
 }
 
 /// Whether `claude auth status` names a claude.ai login (not an API key).
@@ -722,7 +1003,7 @@ pub fn shell_quote(word: &str) -> String {
     if !word.is_empty()
         && word
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "/._-~+=:@".contains(c))
+            .all(|c| c.is_ascii_alphanumeric() || "/._-+=:@".contains(c))
     {
         word.to_owned()
     } else {
@@ -857,7 +1138,7 @@ pub fn systemd_unit(exe: &str, config: &Path, path_env: &str) -> String {
 pub fn need_terminal() -> Result<()> {
     // SAFETY: isatty reads the state of descriptor 0.
     if unsafe { libc::isatty(0) } == 0 {
-        bail!("octotrigger setup asks questions: run it in a terminal");
+        bail!("this command asks questions: run it in a terminal");
     }
     Ok(())
 }
@@ -901,6 +1182,36 @@ mod tests {
     }
 
     #[test]
+    fn the_own_install_stays_in_its_folder_at_the_pinned_commit() {
+        let own = OwnHermes {
+            root: PathBuf::from("/h/.octotrigger/agents/hermes"),
+        };
+        let line = own_install_command(&own);
+        assert!(
+            line.contains(&format!("hermes-agent/{HERMES_PIN}/scripts/install.sh")),
+            "{line}"
+        );
+        assert!(
+            line.contains("| HOME=/h/.octotrigger/agents/hermes/installer-home bash -s --"),
+            "{line}"
+        );
+        assert!(
+            line.contains("--dir /h/.octotrigger/agents/hermes/hermes-agent"),
+            "{line}"
+        );
+        assert!(
+            line.contains("--hermes-home /h/.octotrigger/agents/hermes/home"),
+            "{line}"
+        );
+        assert!(line.contains(&format!("--commit {HERMES_PIN}")), "{line}");
+        assert!(line.contains("--non-interactive"), "{line}");
+        assert_eq!(
+            own.program(),
+            Path::new("/h/.octotrigger/agents/hermes/hermes-agent/.hermes/bin/hermes")
+        );
+    }
+
+    #[test]
     fn the_service_files_start_the_watcher_with_this_config() {
         let plist = launchd_plist(
             "/usr/local/bin/octotrigger",
@@ -929,42 +1240,56 @@ mod tests {
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
-    /// A machine where Hermes is installed, and each login appears once its
-    /// command ran.
+    /// A machine with nothing installed, where each step's result appears
+    /// once its command ran.
     struct Fake {
         answers: VecDeque<&'static str>,
         said: Vec<String>,
         ran: RefCell<Vec<String>>,
-        hermes_home: PathBuf,
+        own: OwnHermes,
         auth_file: PathBuf,
+    }
+
+    impl Fake {
+        fn new(paths: &Paths, auth_file: PathBuf, answers: &[&'static str]) -> Self {
+            Self {
+                answers: answers.iter().copied().collect(),
+                said: Vec::new(),
+                ran: RefCell::new(Vec::new()),
+                own: paths.own.clone(),
+                auth_file,
+            }
+        }
+
+        fn ran_with(&self, text: &str) -> bool {
+            self.ran.borrow().iter().any(|line| line.contains(text))
+        }
     }
 
     impl Machine for Fake {
         fn output(&self, program: &str, args: &[&str], env: &[(&str, &str)]) -> Option<Output> {
-            let ran = self.ran.borrow();
+            let own = program == self.own.program().display().to_string();
+            if own {
+                assert_eq!(
+                    env,
+                    [("HERMES_HOME", self.own.home().to_str().expect("utf-8"))],
+                    "octotrigger's Hermes always runs with its own home"
+                );
+            }
             match (program, args) {
-                ("hermes", ["--version"]) => Some(Output {
+                (_, ["--version"]) if own && self.ran_with("install.sh") => Some(Output {
                     ok: true,
-                    text: "Hermes Agent v0.21.6 (2026.9.24)\n".into(),
+                    text: "Hermes Agent v0.21.7 (2026.9.24)\n".into(),
                 }),
-                ("hermes", ["auth", "list"]) => {
-                    assert_eq!(
-                        env,
-                        [("HERMES_HOME", self.hermes_home.to_str().expect("utf-8"))]
-                    );
-                    let added = ran
-                        .iter()
-                        .any(|line| line.ends_with("hermes auth add openai-codex"));
-                    Some(Output {
-                        ok: true,
-                        text: if added {
-                            "openai-codex (1 credentials):\n  #1  x oauth id=1 device_code ←\n"
-                        } else {
-                            ""
-                        }
-                        .into(),
-                    })
-                }
+                (_, ["auth", "list"]) if own => Some(Output {
+                    ok: true,
+                    text: if self.ran_with("auth add openai-codex") {
+                        "openai-codex (1 credentials):\n  #1  x oauth id=1 device_code ←\n"
+                    } else {
+                        ""
+                    }
+                    .into(),
+                }),
                 _ => None,
             }
         }
@@ -980,7 +1305,7 @@ mod tests {
                     scope: MCP_SCOPE.into(),
                     organization_id: "org-1".into(),
                     token_endpoint: "http://127.0.0.1:1/token".into(),
-                    resource: config::Toolscaled::default().mcp_url,
+                    resource: Toolscaled::default().mcp_url,
                 };
                 auth::save(&self.auth_file, &tokens).expect("save");
             }
@@ -1005,61 +1330,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn setup_takes_a_new_machine_from_nothing_to_a_running_watcher() {
-        let dir = tempfile::tempdir().expect("dir");
-        let home = dir.path().to_path_buf();
-        let config_path = home.join("conf/config.yaml");
-        let hermes_home = home.join("conf/hermes");
-        let auth_file = home.join("conf/auth.json");
+    /// Paths in a test folder, with a config written up front that holds
+    /// this test's auth file and folders (setup keeps a config it finds).
+    fn test_paths(home: &Path) -> (Paths, PathBuf) {
+        let config_path = home.join(".config/octotrigger/config.yaml");
+        let auth_file = home.join(".config/octotrigger/auth.json");
         let paths = Paths {
             config: config_path.clone(),
-            hermes_home: hermes_home.clone(),
-            home: home.clone(),
+            own: OwnHermes {
+                root: home.join(".octotrigger/agents/hermes"),
+            },
+            home: home.to_path_buf(),
             exe: "/bin/octotrigger".into(),
             path_env: "/usr/bin:/bin".into(),
             machine: "test-mac".into(),
         };
-        let mut fake = Fake {
-            // The plan (dropped below), the ChatGPT login, the sign-in, the
-            // warning, the check, the launchd file, its start.
-            answers: VecDeque::from(["1", "", "", "yes", "", "", ""]),
-            said: Vec::new(),
-            ran: RefCell::new(Vec::new()),
-            hermes_home: hermes_home.clone(),
-            auth_file: auth_file.clone(),
-        };
-        // A config written up front, with this test's auth file, log folder
-        // and Hermes home; the plan comes from it, so setup asks no plan.
+        let own = &paths.own;
+        let starter = config::starter("test-mac", Plan::ChatGpt, Agent::Own)
+            .replace(
+                "machine: test-mac\n",
+                &format!(
+                    "machine: test-mac\ntoolscaled:\n  auth_file: {}\nlog_dir: {}\nstate_file: {}\n\
+                     stop_file: {}\nwork_dir: {}\n",
+                    auth_file.display(),
+                    home.join(".local/state/octotrigger").display(),
+                    home.join(".local/state/octotrigger/claims.json").display(),
+                    home.join(".config/octotrigger/stop").display(),
+                    home.join(".local/state/octotrigger/work").display(),
+                ),
+            )
+            .replace(
+                "HERMES_HOME: ~/.octotrigger/agents/hermes/home",
+                &format!("HERMES_HOME: {}", own.home().display()),
+            );
         std::fs::create_dir_all(config_path.parent().expect("parent")).expect("dir");
-        let starter = config::starter("test-mac", Plan::ChatGpt).replace(
-            "machine: test-mac\n",
-            &format!(
-                "machine: test-mac\ntoolscaled:\n  auth_file: {}\nlog_dir: {}\n",
-                auth_file.display(),
-                home.join("log").display()
-            ),
-        );
-        let starter = starter.replace(
-            "HERMES_HOME: ~/.config/octotrigger/hermes",
-            &format!("HERMES_HOME: {}", hermes_home.display()),
-        );
         std::fs::write(&config_path, starter).expect("config");
-        fake.answers.pop_front();
+        (paths, auth_file)
+    }
 
+    #[test]
+    fn setup_takes_a_new_machine_from_nothing_to_a_running_watcher() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = dir.path();
+        let (paths, auth_file) = test_paths(home);
+        // The install, the ChatGPT login, the sign-in, the warning, the
+        // check, the launchd file, its start. Hermes and the plan come from
+        // the config, so setup asks neither.
+        let mut fake = Fake::new(&paths, auth_file.clone(), &["", "", "", "yes", "", "", ""]);
         let finished = run(&mut fake, &paths).expect("setup");
         let said = fake.said.join("\n");
         assert!(finished, "{said}");
         let ran = fake.ran.borrow().clone();
+        let own = &paths.own;
+        let config = paths.config.display();
         assert_eq!(
             ran,
             [
+                own_install_command(own),
                 format!(
-                    "HERMES_HOME={} hermes auth add openai-codex",
-                    hermes_home.display()
+                    "HERMES_HOME={} {} auth add openai-codex",
+                    own.home().display(),
+                    own.program().display()
                 ),
-                format!("/bin/octotrigger --config {} login", config_path.display()),
-                format!("/bin/octotrigger --config {} check", config_path.display()),
+                format!("/bin/octotrigger --config {config} login"),
+                format!("/bin/octotrigger --config {config} check"),
                 format!(
                     "launchctl bootstrap gui/501 {}",
                     home.join("Library/LaunchAgents/com.octotrigger.watcher.plist")
@@ -1068,58 +1402,71 @@ mod tests {
             ],
             "{said}"
         );
-        assert!(said.contains("Done: Hermes Agent 0.21.6."), "{said}");
-        let hermes = std::fs::read_to_string(hermes_home.join("config.yaml")).expect("hermes");
+        assert!(said.contains("Done: Hermes Agent 0.21.7 in"), "{said}");
+        let hermes = std::fs::read_to_string(own.home().join("config.yaml")).expect("hermes");
         assert!(hermes.contains("Bearer ${OCTOTRIGGER_TOOLSCALED_TOKEN}"));
-        let config = Config::load(&config_path).expect("config");
-        assert!(config.token_warning_confirmed.is_some());
+        assert!(hermes.contains("expose_on_path: false"));
+        assert!(
+            Config::load(&paths.config)
+                .expect("config")
+                .token_warning_confirmed
+                .is_some()
+        );
         assert!(
             home.join("Library/LaunchAgents/com.octotrigger.watcher.plist")
                 .exists()
         );
 
-        // A second setup finds every step done and runs nothing.
-        let mut again = Fake {
-            answers: VecDeque::new(),
-            said: Vec::new(),
-            ran: RefCell::new(ran),
-            hermes_home,
-            auth_file,
-        };
+        // A second setup finds every step done; only the check runs again.
+        let mut again = Fake::new(&paths, auth_file, &[""]);
+        *again.ran.borrow_mut() = ran;
         let before = again.ran.borrow().len();
-        // The check is the one step that always runs; answer it.
-        again.answers.push_back("");
         assert!(run(&mut again, &paths).expect("setup"));
         let ran = again.ran.borrow().clone();
-        assert_eq!(ran.len(), before + 1, "only the check runs again: {ran:?}");
+        assert_eq!(ran.len(), before + 1, "{ran:?}");
         assert!(ran.last().expect("ran").ends_with(" check"));
+
+        // Uninstall: the service stops, its file and octotrigger's Hermes go,
+        // and with --all the config, sign-in and logs too.
+        std::fs::create_dir_all(own.code()).expect("code");
+        std::fs::create_dir_all(home.join(".local/state/octotrigger/runs")).expect("logs");
+        std::fs::create_dir_all(home.join(".local/state/other")).expect("another program");
+        let mut out = Fake::new(&paths, home.join("unused"), &["y", "y"]);
+        assert!(uninstall(&mut out, &paths, true).expect("uninstall"));
+        let said = out.said.join("\n");
+        assert!(
+            out.ran_with("launchctl bootout gui/501/com.octotrigger.watcher"),
+            "{said}"
+        );
+        assert!(
+            !home
+                .join("Library/LaunchAgents/com.octotrigger.watcher.plist")
+                .exists()
+        );
+        assert!(!home.join(".octotrigger").exists(), "{said}");
+        assert!(!home.join(".config/octotrigger").exists(), "{said}");
+        assert!(!home.join(".local/state/octotrigger").exists(), "{said}");
+        assert!(
+            home.join(".local/state").exists(),
+            "only octotrigger's folders"
+        );
     }
 
     #[test]
-    fn setup_stops_with_the_command_when_the_person_says_no() {
+    fn setup_asks_which_hermes_and_stops_with_the_command_on_a_no() {
         let dir = tempfile::tempdir().expect("dir");
-        let paths = Paths {
-            config: dir.path().join("config.yaml"),
-            hermes_home: dir.path().join("hermes"),
-            home: dir.path().to_path_buf(),
-            exe: "octotrigger".into(),
-            path_env: String::new(),
-            machine: "m".into(),
-        };
-        let mut fake = Fake {
-            answers: VecDeque::from(["1", "n"]),
-            said: Vec::new(),
-            ran: RefCell::new(Vec::new()),
-            hermes_home: paths.hermes_home.clone(),
-            auth_file: dir.path().join("auth.json"),
-        };
+        let (paths, auth_file) = test_paths(dir.path());
+        std::fs::remove_file(&paths.config).expect("no config");
+        // octotrigger's own Hermes, then no to the install.
+        let mut fake = Fake::new(&paths, auth_file, &["", "n"]);
         assert!(!run(&mut fake, &paths).expect("setup"));
         let said = fake.said.join("\n");
         assert!(
-            said.contains(&format!(
-                "Run: HERMES_HOME={} hermes auth add openai-codex",
-                paths.hermes_home.display()
-            )),
+            said.contains("Which Hermes Agent runs your agents?"),
+            "{said}"
+        );
+        assert!(
+            said.contains(&format!("Run: {}", own_install_command(&paths.own))),
             "{said}"
         );
         assert!(
@@ -1127,6 +1474,26 @@ mod tests {
             "{said}"
         );
         assert!(fake.ran.borrow().is_empty());
-        assert!(!paths.config.exists(), "no config before the login");
+        assert!(!paths.config.exists(), "no config before Hermes is there");
+        assert!(
+            paths.own.home().join("config.yaml").exists(),
+            "the home's config comes before the install"
+        );
+    }
+
+    #[test]
+    fn a_persons_own_hermes_is_used_as_it_is() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (paths, auth_file) = test_paths(dir.path());
+        std::fs::remove_file(&paths.config).expect("no config");
+        // My own Hermes, then no to its install.
+        let mut fake = Fake::new(&paths, auth_file, &["2", "n"]);
+        assert!(!run(&mut fake, &paths).expect("setup"));
+        let said = fake.said.join("\n");
+        assert!(said.contains(&format!("Run: {HERMES_INSTALL}")), "{said}");
+        assert!(
+            !paths.own.root.exists(),
+            "nothing of octotrigger's own Hermes is written"
+        );
     }
 }

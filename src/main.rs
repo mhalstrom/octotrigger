@@ -53,6 +53,13 @@ enum Command {
     },
     /// The claims held, the agents running and the day's counts.
     Status,
+    /// Stop and remove the watcher's launchd or systemd file, and remove
+    /// octotrigger's own Hermes (after a yes).
+    Uninstall {
+        /// Also remove octotrigger's config, sign-in and logs (after a yes).
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -114,6 +121,13 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Status => status(&Config::load(&path)?),
+        Command::Uninstall { all } => {
+            setup::need_terminal()?;
+            if !setup::uninstall(&mut Terminal, &paths(path)?, all)? {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -149,7 +163,7 @@ fn paths(config: PathBuf) -> Result<Paths> {
         .unwrap_or_else(|| "my-machine".to_owned());
     Ok(Paths {
         config,
-        hermes_home: config::hermes_home(),
+        own: config::OwnHermes::new(),
         home: config::home(),
         exe: std::env::current_exe()
             .context("find this program")?

@@ -19,12 +19,56 @@ pub fn default_path() -> PathBuf {
 /// fresh for each run; the agent's MCP config names it, never the token.
 pub const AGENT_TOKEN_ENV: &str = "OCTOTRIGGER_TOOLSCALED_TOKEN";
 
-/// The Hermes home of the agents that octotrigger starts: its own config,
-/// with the Toolscaled server on octotrigger's sign-in, and its own model
-/// login. The person's own Hermes (`~/.hermes`) stays as it is.
-#[must_use]
-pub fn hermes_home() -> PathBuf {
-    home().join(".config/octotrigger/hermes")
+/// octotrigger's own Hermes Agent, installed in one folder of its own: its
+/// code, its Hermes home (config, model login, runtime), and the home folder
+/// its installer writes shell files to. Nothing outside the folder changes,
+/// and the person's own Hermes (`~/.hermes`) is never read or written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnHermes {
+    pub root: PathBuf,
+}
+
+/// The folder of [`OwnHermes`], under the home folder.
+pub const OWN_HERMES_DIR: &str = ".octotrigger/agents/hermes";
+
+impl OwnHermes {
+    /// `~/.octotrigger/agents/hermes`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            root: home().join(OWN_HERMES_DIR),
+        }
+    }
+
+    /// The Hermes code (a git checkout at the pinned commit).
+    #[must_use]
+    pub fn code(&self) -> PathBuf {
+        self.root.join("hermes-agent")
+    }
+
+    /// The `hermes` command of this install.
+    #[must_use]
+    pub fn program(&self) -> PathBuf {
+        self.code().join(".hermes/bin/hermes")
+    }
+
+    /// Its `HERMES_HOME`.
+    #[must_use]
+    pub fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
+    /// The `HOME` the installer runs with, so its shell lines land here.
+    #[must_use]
+    pub fn installer_home(&self) -> PathBuf {
+        self.root.join("installer-home")
+    }
+}
+
+impl Default for OwnHermes {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The person's home folder.
@@ -339,19 +383,21 @@ impl Plan {
         }
     }
 
-    /// The Hermes command of a job on this plan.
+    /// The Hermes command of a job on this plan, with `program` as the
+    /// `hermes` command.
     #[must_use]
-    pub const fn agent_command(self) -> &'static str {
+    pub fn agent_command(self, program: &str) -> String {
         match self {
-            Self::ChatGpt => {
-                "hermes -z \"$(cat {prompt_file})\" --provider openai-codex -m gpt-6.1-terra\n\
-                 \x20     -t toolscaled,file --usage-file {usage_file}"
-            }
-            Self::Claude => {
-                "hermes -z \"$(cat {prompt_file})\"\n\
-                 \x20     --provider claude-subscription-directsdk-experimental -m 'claude-sonnet-5-5[1m]'\n\
-                 \x20     -t toolscaled,file --usage-file {usage_file}"
-            }
+            Self::ChatGpt => format!(
+                "{program} -z \"$(cat {{prompt_file}})\"\n\
+                 \x20     --provider openai-codex -m gpt-6.1-terra\n\
+                 \x20     -t toolscaled,file --usage-file {{usage_file}}"
+            ),
+            Self::Claude => format!(
+                "{program} -z \"$(cat {{prompt_file}})\"\n\
+                 \x20     --provider {CLAUDE_PROVIDER} -m 'claude-sonnet-5-5[1m]'\n\
+                 \x20     -t toolscaled,file --usage-file {{usage_file}}"
+            ),
         }
     }
 
@@ -368,16 +414,64 @@ impl Plan {
 /// The Hermes provider of the Claude plugin.
 pub const CLAUDE_PROVIDER: &str = "claude-subscription-directsdk-experimental";
 
+/// Which Hermes runs the agents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Agent {
+    /// octotrigger's own Hermes ([`OwnHermes`]); the default.
+    Own,
+    /// The person's own Hermes setup: `hermes` on the PATH and `~/.hermes`,
+    /// with its own Toolscaled connection.
+    Mine,
+}
+
+impl Agent {
+    /// The Hermes of a job: [`Agent::Own`] when its `HERMES_HOME` is
+    /// octotrigger's own, [`Agent::Mine`] for another Hermes job, `None` for
+    /// a job that does not run Hermes.
+    #[must_use]
+    pub fn of_job(job: &Job, own: &OwnHermes) -> Option<Self> {
+        let home = own.home().display().to_string();
+        if job
+            .env_values()
+            .iter()
+            .any(|(name, value)| name == "HERMES_HOME" && *value == home)
+        {
+            return Some(Self::Own);
+        }
+        let program = job.agent.split_whitespace().next().unwrap_or_default();
+        (Path::new(program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("hermes"))
+        .then_some(Self::Mine)
+    }
+}
+
 /// The config `octotrigger setup` writes when there is none: one job with
 /// the Hermes command of the plan, for the person to change.
 #[must_use]
-pub fn starter(machine: &str, plan: Plan) -> String {
+pub fn starter(machine: &str, plan: Plan, agent: Agent) -> String {
+    let (program, env) = match agent {
+        Agent::Own => (
+            format!("~/{OWN_HERMES_DIR}/hermes-agent/.hermes/bin/hermes"),
+            format!("\x20   env:\n\x20     HERMES_HOME: ~/{OWN_HERMES_DIR}/home\n"),
+        ),
+        Agent::Mine => ("hermes".to_owned(), String::new()),
+    };
+    let connection = match agent {
+        Agent::Own => format!(
+            "# writes its token use. The agent reaches Toolscaled on octotrigger's\n\
+             # sign-in: octotrigger puts a fresh token in {AGENT_TOKEN_ENV} for each run.\n"
+        ),
+        Agent::Mine => "# writes its token use. The agent uses your own Hermes and its own\n\
+                        # Toolscaled connection.\n"
+            .to_owned(),
+    };
     format!(
         "# octotrigger config. The agent command runs one task and exits.\n\
          # {{prompt_file}}: the run's start prompt from Toolscaled, word for word.\n\
          # {{folder}}: the run's own empty folder. {{usage_file}}: where the agent\n\
-         # writes its token use. The agent reaches Toolscaled on octotrigger's\n\
-         # sign-in: octotrigger puts a fresh token in {AGENT_TOKEN_ENV} for each run.\n\
+         {connection}\
          machine: {machine}\n\
          poll_seconds: 30\n\
          limits:\n\
@@ -391,12 +485,11 @@ pub fn starter(machine: &str, plan: Plan) -> String {
          \x20   lease_seconds: 600\n\
          \x20   run_timeout_minutes: 20\n\
          \x20   unset_env: [{api_key}]\n\
-         \x20   env:\n\
-         \x20     HERMES_HOME: ~/.config/octotrigger/hermes\n\
+         {env}\
          \x20   agent: >-\n\
          \x20     {command}\n",
         api_key = plan.api_key(),
-        command = plan.agent_command(),
+        command = plan.agent_command(&program),
     )
 }
 
@@ -408,6 +501,9 @@ pub fn hermes_config(mcp_url: &str) -> String {
     format!(
         "# Written by octotrigger setup. The Hermes of the agents that octotrigger\n\
          # starts. Your own Hermes (~/.hermes) is not changed.\n\
+         cli:\n\
+         \x20 # No `hermes` command on your PATH: octotrigger calls this one by its path.\n\
+         \x20 expose_on_path: false\n\
          mcp_servers:\n\
          \x20 toolscaled:\n\
          \x20   url: {mcp_url}\n\
@@ -433,7 +529,7 @@ mod tests {
     fn the_starter_config_reads_and_checks() {
         for plan in [Plan::ChatGpt, Plan::Claude] {
             let config: Config =
-                serde_yaml::from_str(&starter("test-machine", plan)).expect("reads");
+                serde_yaml::from_str(&starter("test-machine", plan, Agent::Own)).expect("reads");
             config.check().expect("checks");
             let job = &config.jobs[0];
             assert_eq!(job.workflows, Workflows::All);
@@ -444,18 +540,33 @@ mod tests {
             let env = job.env_values();
             assert_eq!(env.len(), 1);
             assert_eq!(env[0].0, "HERMES_HOME");
-            assert_eq!(env[0].1, hermes_home().display().to_string());
+            assert_eq!(env[0].1, OwnHermes::new().home().display().to_string());
             assert!(job.agent.contains("-t toolscaled,file"), "{}", job.agent);
+            assert!(
+                job.agent
+                    .starts_with("~/.octotrigger/agents/hermes/hermes-agent/.hermes/bin/hermes -z"),
+                "{}",
+                job.agent
+            );
+            assert_eq!(Agent::of_job(job, &OwnHermes::new()), Some(Agent::Own));
+
+            let mine: Config =
+                serde_yaml::from_str(&starter("m", plan, Agent::Mine)).expect("reads");
+            mine.check().expect("checks");
+            let job = &mine.jobs[0];
+            assert!(job.env.is_empty());
+            assert!(job.agent.starts_with("hermes -z"), "{}", job.agent);
+            assert_eq!(Agent::of_job(job, &OwnHermes::new()), Some(Agent::Mine));
         }
         assert!(
-            starter("m", Plan::Claude).contains("-m 'claude-sonnet-5-5[1m]'"),
+            starter("m", Plan::Claude, Agent::Own).contains("-m 'claude-sonnet-5-5[1m]'"),
             "the Claude model is a full id"
         );
     }
 
     #[test]
     fn a_job_with_repair_types_or_a_long_lease_is_refused() {
-        let base = starter("m", Plan::ChatGpt);
+        let base = starter("m", Plan::ChatGpt, Agent::Own);
         let repair = base.replace("types: [1, 2]", "types: [3]");
         let config: Config = serde_yaml::from_str(&repair).expect("reads");
         assert!(config.check().is_err());
@@ -466,7 +577,7 @@ mod tests {
         let config: Config = serde_yaml::from_str(&slow).expect("reads");
         assert!(config.check().is_err(), "a run longer than its token");
         let token = base.replace(
-            "HERMES_HOME: ~/.config/octotrigger/hermes",
+            "HERMES_HOME: ~/.octotrigger/agents/hermes/home",
             "OCTOTRIGGER_TOOLSCALED_TOKEN: x",
         );
         let config: Config = serde_yaml::from_str(&token).expect("reads");
@@ -488,6 +599,7 @@ mod tests {
             Some(false)
         );
         assert_eq!(value["memory"]["memory_enabled"].as_bool(), Some(false));
+        assert_eq!(value["cli"]["expose_on_path"].as_bool(), Some(false));
     }
 
     #[test]
