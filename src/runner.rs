@@ -408,7 +408,7 @@ impl<S: Surface> Runner<S> {
         let job: Job = self.config.jobs[job_index].clone();
         let work_dir = expand(&self.config.work_dir);
         let output = self.log.run_output(&claim.run_id);
-        let started = agent::prepare(&work_dir, &claim, &self.config.toolscaled.mcp_url)
+        let started = agent::prepare(&work_dir, &claim)
             .and_then(|folder| agent::spawn(&job, &folder, &output).map(|child| (folder, child)));
         let (folder, child) = match started {
             Ok(pair) => pair,

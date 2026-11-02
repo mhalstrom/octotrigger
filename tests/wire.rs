@@ -71,8 +71,8 @@ fn claim_renew_and_release_go_to_surface_with_the_bearer_and_the_workspace() {
     let auth = signed_in(dir.path());
     let claim = json!({
         "run_id": "r1", "workflow_id": "w1", "kind": "agent_run", "code": "s1",
-        "lease_until": "2026-11-02T10:10:00Z", "claim_token": "c1", "run_token": "t1",
-        "prompt": "Connect."
+        "lease_until": "2026-11-02T10:10:00Z", "claim_token": "c1",
+        "start_prompt": "You are running a Toolscaled agent run."
     });
     let (address, got) = serve(vec![
         (
@@ -98,7 +98,10 @@ fn claim_renew_and_release_go_to_surface_with_the_bearer_and_the_workspace() {
         .claim(&["w1".to_owned()], "hermes on test", 600)
         .expect("claim")
         .expect("a run");
-    assert_eq!(claimed.run_token, "t1");
+    assert_eq!(
+        claimed.start_prompt,
+        "You are running a Toolscaled agent run."
+    );
     let (path, bearer, body) = got.recv().expect("request");
     assert_eq!(path, "/surface/automation_tool/claim_agent_work");
     assert_eq!(bearer, "Bearer access-1");

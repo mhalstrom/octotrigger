@@ -1,11 +1,9 @@
 //! One agent process for one claimed run: its own empty folder, the run's
-//! prompt and MCP configs in it, the command in its own process group, and
-//! its token use when it ends.
+//! start prompt in it, the command in its own process group, and its token
+//! use when it ends.
 //!
-//! The run's token goes into the MCP config files of the folder only:
-//! `mcp.json` (the form of `claude -p --mcp-config`) and
-//! `hermes/config.yaml` (Hermes, with `HERMES_HOME` set to that folder).
-//! Never into the prompt, the command line or a shared config.
+//! The agent reaches Toolscaled through its own Toolscaled connection, which
+//! the person set up once; octotrigger gives it no credential.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -14,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use anyhow::{Context, Result};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::config::Job;
 use crate::surface::{Claim, Usage};
@@ -26,49 +24,25 @@ pub struct Folder {
     pub usage_file: PathBuf,
 }
 
-/// Makes the run's folder, readable by the person only, with the prompt and
-/// the MCP configs.
+/// Makes the run's folder, readable by the person only, with the start
+/// prompt as Toolscaled wrote it, word for word.
 ///
 /// # Errors
 ///
 /// A folder or file that cannot be written.
-pub fn prepare(work_dir: &Path, claim: &Claim, mcp_url: &str) -> Result<Folder> {
+pub fn prepare(work_dir: &Path, claim: &Claim) -> Result<Folder> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::create_dir_all(work_dir)?;
     let path = work_dir.join(format!("run-{}", claim.run_id));
     if path.exists() {
         std::fs::remove_dir_all(&path)?;
     }
-    std::fs::create_dir_all(path.join("hermes"))?;
+    std::fs::create_dir_all(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
-    let write = |file: &Path, text: &str| -> Result<()> {
-        let mut handle = File::create(file)?;
-        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))?;
-        handle.write_all(text.as_bytes())?;
-        Ok(())
-    };
     let prompt_file = path.join("prompt.txt");
-    write(&prompt_file, &claim.prompt)?;
-    let bearer = format!("Bearer {}", claim.run_token);
-    write(
-        &path.join("mcp.json"),
-        &serde_json::to_string_pretty(&json!({
-            "mcpServers": {"toolscaled": {
-                "type": "http",
-                "url": mcp_url,
-                "headers": {"Authorization": bearer},
-            }}
-        }))?,
-    )?;
-    write(
-        &path.join("hermes/config.yaml"),
-        &serde_yaml::to_string(&json!({
-            "mcp_servers": {"toolscaled": {
-                "url": mcp_url,
-                "headers": {"Authorization": bearer},
-            }}
-        }))?,
-    )?;
+    let mut handle = File::create(&prompt_file)?;
+    std::fs::set_permissions(&prompt_file, std::fs::Permissions::from_mode(0o600))?;
+    handle.write_all(claim.start_prompt.as_bytes())?;
     Ok(Folder {
         usage_file: path.join("usage.json"),
         prompt_file,
@@ -106,7 +80,6 @@ pub fn spawn(job: &Job, folder: &Folder, output: &Path) -> Result<Child> {
         .arg("-c")
         .arg(command_line(job, folder))
         .current_dir(&folder.path)
-        .env("HERMES_HOME", folder.path.join("hermes"))
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -222,8 +195,7 @@ mod tests {
             code: "s1".into(),
             lease_until: String::new(),
             claim_token: "c1".into(),
-            run_token: "tok-1".into(),
-            prompt: "Connect with code s1.".into(),
+            start_prompt: "You are running a Toolscaled agent run. Nobody reads this chat.".into(),
         }
     }
 
@@ -232,38 +204,27 @@ mod tests {
     }
 
     #[test]
-    fn the_folder_holds_the_prompt_and_the_token_in_the_mcp_configs_only() {
+    fn the_folder_holds_the_start_prompt_word_for_word_and_nothing_else() {
         let work = tempfile::tempdir().expect("work");
-        let folder =
-            prepare(work.path(), &claim(), "https://mcp.example.test/mcp").expect("folder");
+        let folder = prepare(work.path(), &claim()).expect("folder");
         assert_eq!(
             std::fs::read_to_string(&folder.prompt_file).expect("prompt"),
-            "Connect with code s1."
+            claim().start_prompt
         );
-        let mcp: Value = serde_json::from_str(
-            &std::fs::read_to_string(folder.path.join("mcp.json")).expect("mcp"),
-        )
-        .expect("json");
-        assert_eq!(
-            mcp["mcpServers"]["toolscaled"]["headers"]["Authorization"],
-            "Bearer tok-1"
-        );
-        let hermes = std::fs::read_to_string(folder.path.join("hermes/config.yaml")).expect("yaml");
-        assert!(hermes.contains("Bearer tok-1"), "{hermes}");
-        let line = command_line(
-            &job("agent -z {prompt_file} --usage {usage_file} -m {folder}/mcp.json"),
-            &folder,
-        );
-        assert!(!line.contains("tok-1"), "{line}");
+        let names: Vec<_> = std::fs::read_dir(&folder.path)
+            .expect("folder")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["prompt.txt"]);
+        let line = command_line(&job("agent -z {prompt_file} --usage {usage_file}"), &folder);
         assert!(line.contains("prompt.txt'"), "{line}");
     }
 
     #[test]
     fn the_agent_runs_in_its_folder_without_the_unset_names() {
         let work = tempfile::tempdir().expect("work");
-        let folder =
-            prepare(work.path(), &claim(), "https://mcp.example.test/mcp").expect("folder");
-        let mut job = job("pwd; echo key=${OCTO_TEST_KEY:-none}; echo home=$HERMES_HOME");
+        let folder = prepare(work.path(), &claim()).expect("folder");
+        let mut job = job("pwd; echo key=${OCTO_TEST_KEY:-none}");
         job.unset_env = vec!["OCTO_TEST_KEY".into()];
         // SAFETY: the test sets a name only it reads.
         unsafe { std::env::set_var("OCTO_TEST_KEY", "secret") };
@@ -276,7 +237,6 @@ mod tests {
         let text = std::fs::read_to_string(&output).expect("output");
         assert!(text.contains("run-r1"), "{text}");
         assert!(text.contains("key=none"), "{text}");
-        assert!(text.contains("hermes"), "{text}");
     }
 
     #[test]
@@ -295,8 +255,7 @@ mod tests {
         assert!(usage_in(&serde_json::json!({"text": "no counts"})).is_none());
 
         let work = tempfile::tempdir().expect("work");
-        let folder =
-            prepare(work.path(), &claim(), "https://mcp.example.test/mcp").expect("folder");
+        let folder = prepare(work.path(), &claim()).expect("folder");
         let output = work.path().join("out.log");
         std::fs::write(&output, format!("some text\n{claude}\n")).expect("write");
         assert_eq!(

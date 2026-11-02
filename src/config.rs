@@ -64,7 +64,8 @@ pub struct Toolscaled {
     /// The Toolscaled app: sign-in and the claim calls.
     #[serde(default = "default_base_url")]
     pub base_url: String,
-    /// The MCP server the agent connects to with the run's token.
+    /// The Toolscaled MCP server: the resource that octotrigger's sign-in
+    /// asks for.
     #[serde(default = "default_mcp_url")]
     pub mcp_url: String,
     #[serde(default = "default_auth_file")]
@@ -278,9 +279,9 @@ impl Config {
 pub fn starter(machine: &str) -> String {
     format!(
         "# octotrigger config. The agent command runs one task and exits.\n\
-         # {{prompt_file}}: the run's prompt from Toolscaled. {{folder}}: the run's own\n\
-         # folder, with mcp.json (Toolscaled and the run's token) and hermes/config.yaml.\n\
-         # {{usage_file}}: where the agent writes its token use.\n\
+         # {{prompt_file}}: the run's start prompt from Toolscaled, word for word.\n\
+         # {{folder}}: the run's own empty folder. {{usage_file}}: where the agent\n\
+         # writes its token use. The agent uses its own Toolscaled connection.\n\
          machine: {machine}\n\
          poll_seconds: 30\n\
          limits:\n\

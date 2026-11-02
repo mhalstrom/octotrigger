@@ -80,8 +80,7 @@ fn claim(n: u32) -> Claim {
         code: format!("code-{n}"),
         lease_until: String::new(),
         claim_token: format!("claim-{n}"),
-        run_token: format!("token-{n}"),
-        prompt: "Connect with the code and do the run.".into(),
+        start_prompt: "You are running a Toolscaled agent run. Nobody reads this chat.".into(),
     }
 }
 
@@ -132,7 +131,7 @@ fn a_claimed_run_starts_the_agent_and_ends_with_its_usage() {
     let dir = tempfile::tempdir().expect("dir");
     let fake = Arc::new(Fake::default());
     fake.waiting.lock().expect("lock").push_back(claim(1));
-    let agent = r#"cat {prompt_file} > /dev/null && test -f {folder}/mcp.json && echo "{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100,\"output_tokens\":7}}""#;
+    let agent = r#"cat {prompt_file} | grep -q "Nobody reads this chat" && echo "{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100,\"output_tokens\":7}}""#;
     let mut runner = runner(dir.path(), agent, "", &fake);
 
     runner.step().expect("step");

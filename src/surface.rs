@@ -14,15 +14,14 @@ pub struct Claim {
     pub run_id: String,
     pub workflow_id: String,
     pub kind: String,
-    /// The code the agent connects with.
+    /// The run's session, which the start prompt names.
     pub code: String,
     pub lease_until: String,
     /// The claim's secret for renew and release.
     pub claim_token: String,
-    /// The agent's credential, for its MCP config only.
-    pub run_token: String,
-    /// The text the agent starts with, as Toolscaled wrote it.
-    pub prompt: String,
+    /// The whole text the agent starts with, as Toolscaled wrote it. The
+    /// agent gets it word for word.
+    pub start_prompt: String,
 }
 
 /// How the agent ended.
