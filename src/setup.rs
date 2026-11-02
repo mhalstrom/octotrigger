@@ -50,6 +50,12 @@ const NO_CLAUDE_PLAN: &str = "A Claude plan is not offered: Anthropic's terms fo
      say \"Anthropic does not permit third-party developers to offer Claude.ai login into their \
      own applications, or to route requests through Free, Pro, Max, or Ultra plan credentials \
      on behalf of their users\" (code.claude.com/docs/en/legal-and-compliance).";
+/// Hermes' own install command on Windows (its README: "Windows (native,
+/// PowerShell)").
+pub const HERMES_INSTALL_WINDOWS: &str =
+    "iex (irm https://hermes-agent.nousresearch.com/install.ps1)";
+/// The name of the Task Scheduler task on Windows.
+pub const TASK_NAME: &str = "octotrigger";
 /// The label of the launchd file.
 pub const LAUNCHD_LABEL: &str = "com.octotrigger.watcher";
 
@@ -60,11 +66,14 @@ pub struct Output {
     pub text: String,
 }
 
-/// The operating systems with a service file.
+/// The operating systems with a way to start octotrigger at login. The
+/// command lines that setup prints and runs are `sh` lines, and on Windows
+/// PowerShell lines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Os {
     MacOs,
     Linux,
+    Windows,
     Other,
 }
 
@@ -75,8 +84,32 @@ impl Os {
             Self::MacOs
         } else if cfg!(target_os = "linux") {
             Self::Linux
+        } else if cfg!(windows) {
+            Self::Windows
         } else {
             Self::Other
+        }
+    }
+
+    /// A word quoted for this system's shell: `sh`, or PowerShell, where a
+    /// word in single quotes is plain text.
+    #[must_use]
+    pub fn quote(self, word: &str) -> String {
+        if self == Self::Windows {
+            format!("'{}'", word.replace('\'', "''"))
+        } else {
+            shell_quote(word)
+        }
+    }
+
+    /// A program at the start of a command line: PowerShell runs a quoted
+    /// path only after `&`.
+    #[must_use]
+    pub fn program(self, path: &str) -> String {
+        if self == Self::Windows {
+            format!("& {}", self.quote(path))
+        } else {
+            shell_quote(path)
         }
     }
 }
@@ -118,9 +151,7 @@ impl Machine for Terminal {
     }
 
     fn run(&mut self, line: &str) -> bool {
-        std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(line)
+        crate::platform::shell(line)
             .status()
             .is_ok_and(|status| status.success())
     }
@@ -143,8 +174,15 @@ impl Machine for Terminal {
     }
 
     fn uid(&self) -> u32 {
-        // SAFETY: getuid reads the process's user id and cannot fail.
-        unsafe { libc::getuid() }
+        #[cfg(unix)]
+        {
+            // SAFETY: getuid reads the process's user id and cannot fail.
+            unsafe { libc::getuid() }
+        }
+        #[cfg(not(unix))]
+        {
+            0
+        }
     }
 }
 
@@ -163,6 +201,9 @@ pub struct Paths {
     pub path_env: String,
     /// The machine's short name, for a new config.
     pub machine: String,
+    /// The Windows account (`DOMAIN\\USER`) that the Task Scheduler task
+    /// runs as; empty elsewhere.
+    pub user: String,
 }
 
 /// The Hermes that setup works on: its command and its home.
@@ -187,8 +228,13 @@ impl Hermes {
     }
 
     /// The command line of `args`, with this Hermes and its home.
-    fn line(&self, args: &str) -> String {
+    fn line(&self, os: Os, args: &str) -> String {
         match &self.home {
+            Some(home) if os == Os::Windows => format!(
+                "$env:HERMES_HOME = {}; {} {args}",
+                os.quote(home),
+                os.program(&self.program)
+            ),
             Some(home) => format!(
                 "HERMES_HOME={} {} {args}",
                 shell_quote(home),
@@ -466,13 +512,18 @@ impl<M: Machine> Setup<'_, M> {
         if let Some(text) = ready(self) {
             return self.done(&text);
         }
-        self.m.say(
+        self.m.say(if self.m.os() == Os::Windows {
+            "  Hermes' own installer, at the commit tested with Toolscaled, into this one \
+             folder. It takes about 2 GB and a few minutes. It says that it added `hermes` to \
+             your PATH: the same command takes that entry out again, because octotrigger calls \
+             this Hermes by its path. Setup goes on by itself."
+        } else {
             "  Hermes' own installer, at the commit tested with Toolscaled, into this one \
              folder. It takes about 2 GB and a few minutes. Its last line asks you to reload \
              your shell (`source ~/.zshrc`): that is not for this Hermes, which octotrigger \
-             calls by its path. Setup goes on by itself.",
-        );
-        let command = own_install_command(&self.p.own);
+             calls by its path. Setup goes on by itself."
+        });
+        let command = own_install_command(self.m.os(), &self.p.own);
         self.fix(
             "octotrigger's own Hermes Agent is not installed.",
             &command,
@@ -493,15 +544,20 @@ impl<M: Machine> Setup<'_, M> {
         if let Some(text) = ready(self) {
             return self.done(&text);
         }
+        let install = if self.m.os() == Os::Windows {
+            HERMES_INSTALL_WINDOWS
+        } else {
+            HERMES_INSTALL
+        };
         let (not_done, command) = match hermes.version(&*self.m) {
             Some(v) => (
                 format!("Hermes Agent {} is older than 0.21.4.", show_version(v)),
                 "hermes update",
             ),
-            None => ("Hermes Agent is not installed.".to_owned(), HERMES_INSTALL),
+            None => ("Hermes Agent is not installed.".to_owned(), install),
         };
         let step = self.fix(&not_done, command, ready);
-        if matches!(step, Step::Stop) && command == HERMES_INSTALL {
+        if matches!(step, Step::Stop) && command == install {
             self.m.say(
                 "  When the install says it is done, open a new terminal, so that `hermes` is \
                  on your PATH.",
@@ -582,7 +638,7 @@ impl<M: Machine> Setup<'_, M> {
                     );
                 }
                 self.m.say("  Type the code it shows in your browser.");
-                let command = hermes.line("auth add openai-codex");
+                let command = hermes.line(self.m.os(), "auth add openai-codex");
                 self.fix("Hermes has no openai-codex login.", &command, |me| {
                     hermes
                         .codex_login(&*me.m)
@@ -685,13 +741,14 @@ impl<M: Machine> Setup<'_, M> {
     }
 
     fn octotrigger(&self, command: &str) -> String {
+        let os = self.m.os();
         if self.p.config == config::default_path() {
-            format!("{} {command}", shell_quote(&self.p.exe))
+            format!("{} {command}", os.program(&self.p.exe))
         } else {
             format!(
                 "{} --config {} {command}",
-                shell_quote(&self.p.exe),
-                shell_quote(&self.p.config.display().to_string())
+                os.program(&self.p.exe),
+                os.quote(&self.p.config.display().to_string())
             )
         }
     }
@@ -746,40 +803,76 @@ impl<M: Machine> Setup<'_, M> {
         Step::Stop
     }
 
-    /// The service file of this machine: its path, its text, the commands
-    /// that start and stop it, and the service manager's name.
-    fn service(&self, config: &Config) -> Option<(PathBuf, String, String, String, &'static str)> {
+    /// How this machine starts octotrigger at login: the files to write
+    /// (the first one shows that it is set up), the commands that start and
+    /// stop it, and the service manager's name.
+    fn service(&self, config: &Config) -> Option<Service> {
         match self.m.os() {
             Os::MacOs => {
                 let file = self
                     .p
                     .home
                     .join(format!("Library/LaunchAgents/{LAUNCHD_LABEL}.plist"));
-                Some((
-                    file.clone(),
-                    launchd_plist(
-                        &self.p.exe,
-                        &self.p.config,
-                        &self.p.path_env,
-                        &expand(&config.log_dir),
-                    ),
-                    format!(
+                Some(Service {
+                    files: vec![(
+                        file.clone(),
+                        launchd_plist(
+                            &self.p.exe,
+                            &self.p.config,
+                            &self.p.path_env,
+                            &expand(&config.log_dir),
+                        )
+                        .into_bytes(),
+                    )],
+                    load: format!(
                         "launchctl bootstrap gui/{} {}",
                         self.m.uid(),
                         shell_quote(&file.display().to_string())
                     ),
-                    format!("launchctl bootout gui/{}/{LAUNCHD_LABEL}", self.m.uid()),
-                    "launchd",
-                ))
+                    unload: format!("launchctl bootout gui/{}/{LAUNCHD_LABEL}", self.m.uid()),
+                    name: "launchd",
+                })
             }
-            Os::Linux => Some((
-                self.p.home.join(".config/systemd/user/octotrigger.service"),
-                systemd_unit(&self.p.exe, &self.p.config, &self.p.path_env),
-                "systemctl --user daemon-reload && systemctl --user enable --now octotrigger.service"
+            Os::Linux => Some(Service {
+                files: vec![(
+                    self.p.home.join(".config/systemd/user/octotrigger.service"),
+                    systemd_unit(&self.p.exe, &self.p.config, &self.p.path_env).into_bytes(),
+                )],
+                load: "systemctl --user daemon-reload && systemctl --user enable --now \
+                       octotrigger.service"
                     .to_owned(),
-                "systemctl --user disable --now octotrigger.service".to_owned(),
-                "systemd",
-            )),
+                unload: "systemctl --user disable --now octotrigger.service".to_owned(),
+                name: "systemd",
+            }),
+            Os::Windows => {
+                let folder = self.p.home.join(".octotrigger");
+                let launcher = folder.join("octotrigger.vbs");
+                let task = folder.join("octotrigger.task.xml");
+                let q = |path: &Path| Os::Windows.quote(&path.display().to_string());
+                Some(Service {
+                    files: vec![
+                        (task.clone(), utf16_file(&task_xml(&launcher, &self.p.user))),
+                        (
+                            launcher.clone(),
+                            windows_launcher(&self.p.exe, &self.p.config).into_bytes(),
+                        ),
+                    ],
+                    load: format!(
+                        "schtasks /Create /F /TN {TASK_NAME} /XML {xml} /RU {user} /NP /IT; \
+                         if ($LASTEXITCODE -ne 0) {{ schtasks /Create /F /TN {TASK_NAME} /XML {xml} }}; \
+                         if ($LASTEXITCODE -ne 0) {{ exit 1 }}; \
+                         schtasks /Run /TN {TASK_NAME}; exit $LASTEXITCODE",
+                        xml = q(&task),
+                        user = Os::Windows.quote(&self.p.user),
+                    ),
+                    unload: format!(
+                        "schtasks /Delete /F /TN {TASK_NAME}; Remove-Item -ErrorAction \
+                         SilentlyContinue (Join-Path ([Environment]::GetFolderPath('Startup')) \
+                         'octotrigger.vbs')"
+                    ),
+                    name: "Task Scheduler",
+                })
+            }
             Os::Other => None,
         }
     }
@@ -788,15 +881,22 @@ impl<M: Machine> Setup<'_, M> {
     fn keep_running(&mut self, config: &Config) -> Result<()> {
         self.title(8, "Start the watcher, and keep it running");
         let start = self.octotrigger("start");
-        let Some((file, text, load, unload, name)) = self.service(config) else {
+        let Some(Service {
+            files,
+            load,
+            unload,
+            name,
+        }) = self.service(config)
+        else {
             self.m.say(&format!("  Start it: {start}"));
             return Ok(());
         };
-        if file.exists() {
+        let marker = files[0].0.clone();
+        if marker.exists() {
             self.done(&format!(
                 "{name} starts octotrigger at login and after a crash ({}). To turn that off: \
                  {unload}",
-                file.display()
+                marker.display()
             ));
         } else if self.yes(
             &format!(
@@ -805,13 +905,17 @@ impl<M: Machine> Setup<'_, M> {
             ),
             true,
         ) {
-            write_private(&file, &text)?;
-            self.m.say(&format!("  Wrote {}.", file.display()));
+            for (file, bytes) in &files {
+                write_private_bytes(file, bytes)?;
+                self.m.say(&format!("  Wrote {}.", file.display()));
+            }
             self.m.say(&format!("  Run: {load}"));
             if self.yes("Start it now?", true) && self.m.run(&load) {
                 self.done(&format!(
                     "{name} runs octotrigger. To turn that off: {unload}"
                 ));
+            } else if self.m.os() == Os::Windows {
+                self.startup_folder(&files[1].0);
             } else {
                 self.m.say("  Run that command to start it.\n");
             }
@@ -833,16 +937,49 @@ impl<M: Machine> Setup<'_, M> {
         Ok(())
     }
 
+    /// Windows, when Task Scheduler refuses the task (a policy of the
+    /// computer): the launcher in the person's Startup folder starts
+    /// octotrigger at sign-in instead, with no start again after a crash.
+    fn startup_folder(&mut self, launcher: &Path) {
+        let command = format!(
+            "Copy-Item {} -Destination ([Environment]::GetFolderPath('Startup'))",
+            Os::Windows.quote(&launcher.display().to_string())
+        );
+        self.m.say(
+            "  Task Scheduler did not take the task. Your Startup folder can start octotrigger \
+             at sign-in instead (not again after a crash).",
+        );
+        self.m.say(&format!("  Run: {command}"));
+        if self.yes("Put it in your Startup folder?", true) && self.m.run(&command) {
+            self.done(&format!(
+                "your Startup folder starts octotrigger at sign-in. Start it now: {}",
+                self.octotrigger("start")
+            ));
+        } else {
+            self.m
+                .say("  Run that command to start octotrigger at sign-in.\n");
+        }
+    }
+
     fn uninstall(&mut self, all: bool) -> Result<bool> {
         let config = Config::load(&self.p.config).ok();
         if let Some(config) = &config
-            && let Some((file, _, _, unload, name)) = self.service(config)
-            && file.exists()
+            && let Some(Service {
+                files,
+                unload,
+                name,
+                ..
+            }) = self.service(config)
+            && files[0].0.exists()
         {
             self.m.say(&format!("Stop {name}'s octotrigger: {unload}"));
             self.m.run(&unload);
-            std::fs::remove_file(&file)?;
-            self.m.say(&format!("Removed {}.", file.display()));
+            for (file, _) in &files {
+                if file.exists() {
+                    std::fs::remove_file(file)?;
+                    self.m.say(&format!("Removed {}.", file.display()));
+                }
+            }
         }
         if let Some(config) = &config {
             let state = State::load(&expand(&config.state_file)).unwrap_or_default();
@@ -927,18 +1064,45 @@ impl<M: Machine> Setup<'_, M> {
                 }
             }
         }
+        let program = if self.m.os() == Os::Windows {
+            let folder = Path::new(&self.p.exe)
+                .parent()
+                .map_or_else(|| self.p.exe.clone(), |f| f.display().to_string());
+            format!(
+                "Remove-Item -Recurse -Force {q}; {}",
+                remove_from_user_path(&folder),
+                q = Os::Windows.quote(&folder)
+            )
+        } else {
+            "cargo uninstall octotrigger".to_owned()
+        };
         self.m
-            .say("To remove the program itself: cargo uninstall octotrigger");
+            .say(&format!("To remove the program itself: {program}"));
         Ok(true)
     }
 }
 
 /// The command that installs octotrigger's own Hermes: Hermes' installer at
-/// the pinned commit, its code and home in the one folder, its `HOME` there
-/// too (its shell lines go to that folder, not to the person's shell files),
-/// with no setup questions, no browser tools and no computer-use driver.
+/// the pinned commit, its code and home in the one folder, with no setup
+/// questions, no browser tools and no computer-use driver. On Unix its `HOME`
+/// is there too (its shell lines go to that folder, not to the person's
+/// shell files). On Windows the installer (`install.ps1`) always adds its
+/// `bin` folder to the person's PATH, so the same command takes that entry
+/// out again.
 #[must_use]
-pub fn own_install_command(own: &OwnHermes) -> String {
+pub fn own_install_command(os: Os, own: &OwnHermes) -> String {
+    if os == Os::Windows {
+        let q = |path: PathBuf| os.quote(&path.display().to_string());
+        return format!(
+            "& ([scriptblock]::Create((irm \
+             https://raw.githubusercontent.com/NousResearch/hermes-agent/{HERMES_PIN}/scripts/install.ps1))) \
+             -Commit {HERMES_PIN} -InstallDir {code} -HermesHome {home} -NonInteractive \
+             -SkipBrowser -SkipComputerUse; {path}",
+            code = q(own.code()),
+            home = q(own.home()),
+            path = remove_from_user_path(&own.home().join("bin").display().to_string()),
+        );
+    }
     let q = |path: PathBuf| shell_quote(&path.display().to_string());
     format!(
         "mkdir -p {installer_home} && curl -fsSL \
@@ -984,6 +1148,115 @@ pub fn has_codex_login(text: &str) -> bool {
     false
 }
 
+/// A PowerShell line that takes `folder` out of the person's PATH (the
+/// user part, which a program may change without an administrator).
+fn remove_from_user_path(folder: &str) -> String {
+    format!(
+        "[Environment]::SetEnvironmentVariable('Path', (([Environment]::GetEnvironmentVariable(\
+         'Path', 'User') -split ';' | Where-Object {{ $_ -and $_.TrimEnd('\\') -ne {} }}) -join \
+         ';'), 'User')",
+        Os::Windows.quote(folder.trim_end_matches('\\'))
+    )
+}
+
+/// How a machine starts octotrigger at login.
+struct Service {
+    /// The files to write; the first one shows that it is set up.
+    files: Vec<(PathBuf, Vec<u8>)>,
+    load: String,
+    unload: String,
+    name: &'static str,
+}
+
+/// A text as a UTF-16 file with its byte order mark, as Task Scheduler
+/// reads a task file.
+fn utf16_file(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in text.replace('\n', "\r\n").encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
+}
+
+/// The Task Scheduler task on Windows: at the person's sign-in (30 s
+/// later), with the person's rights only, no time limit, on battery too, and
+/// again a minute after a failure. It runs the launcher with `wscript`, which
+/// has no window (as Hermes Agent starts its own gateway).
+#[must_use]
+pub fn task_xml(launcher: &Path, user: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>octotrigger: claims Toolscaled runs for your agent</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>{user}</UserId>
+      <Delay>PT30S</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{user}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>999</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>wscript.exe</Command>
+      <Arguments>//B //Nologo "{launcher}"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#,
+        user = xml(user),
+        launcher = xml(&launcher.display().to_string()),
+    )
+}
+
+/// The launcher the task runs on Windows: `octotrigger start` with this
+/// config, in a hidden window, and its exit code as the task's, so a crash
+/// counts as a failure.
+#[must_use]
+pub fn windows_launcher(exe: &str, config: &Path) -> String {
+    let line = format!("\"{exe}\" --config \"{}\" start", config.display());
+    format!(
+        "' octotrigger: starts the watcher at sign-in, with no window. Written by octotrigger \
+         setup.\r\n\
+         Option Explicit\r\n\
+         Dim sh\r\n\
+         Set sh = CreateObject(\"WScript.Shell\")\r\n\
+         WScript.Quit sh.Run(\"{}\", 0, True)\r\n",
+        line.replace('"', "\"\"")
+    )
+}
+
 /// A path with the home folder written as `~`.
 fn home_relative(path: &Path, home: &Path) -> String {
     path.strip_prefix(home).map_or_else(
@@ -1008,16 +1281,19 @@ pub fn shell_quote(word: &str) -> String {
 
 /// Writes a file only the person can read, in a folder only they can open.
 fn write_private(path: &Path, text: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+    write_private_bytes(path, text.as_bytes())
+}
+
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(folder) = path.parent() {
         let made = !folder.exists();
         std::fs::create_dir_all(folder)?;
         if made {
-            std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o700))?;
+            crate::platform::make_private(folder, true)?;
         }
     }
-    std::fs::write(path, text)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(path, bytes)?;
+    crate::platform::make_private(path, false)?;
     Ok(())
 }
 
@@ -1131,8 +1407,8 @@ pub fn systemd_unit(exe: &str, config: &Path, path_env: &str) -> String {
 ///
 /// Standard input is not a terminal.
 pub fn need_terminal() -> Result<()> {
-    // SAFETY: isatty reads the state of descriptor 0.
-    if unsafe { libc::isatty(0) } == 0 {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() {
         bail!(
             "this command asks questions: run it in a terminal, or give the answers as flags \
              (octotrigger setup --yes [--agent own|mine] [--plan chatgpt] \
@@ -1168,12 +1444,13 @@ mod tests {
         assert!(!has_codex_login(without));
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_own_install_stays_in_its_folder_at_the_pinned_commit() {
         let own = OwnHermes {
             root: PathBuf::from("/h/.octotrigger/agents/hermes"),
         };
-        let line = own_install_command(&own);
+        let line = own_install_command(Os::MacOs, &own);
         assert!(
             line.contains(&format!("hermes-agent/{HERMES_PIN}/scripts/install.sh")),
             "{line}"
@@ -1198,6 +1475,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_service_files_start_the_watcher_with_this_config() {
         let plist = launchd_plist(
@@ -1235,6 +1513,7 @@ mod tests {
         ran: RefCell<Vec<String>>,
         own: OwnHermes,
         auth_file: PathBuf,
+        os: Os,
     }
 
     impl Fake {
@@ -1245,6 +1524,7 @@ mod tests {
                 ran: RefCell::new(Vec::new()),
                 own: paths.own.clone(),
                 auth_file,
+                os: Os::MacOs,
             }
         }
 
@@ -1264,10 +1544,14 @@ mod tests {
                 );
             }
             match (program, args) {
-                (_, ["--version"]) if own && self.ran_with("install.sh") => Some(Output {
-                    ok: true,
-                    text: "Hermes Agent v0.21.7 (2026.9.24)\n".into(),
-                }),
+                (_, ["--version"])
+                    if own && (self.ran_with("install.sh") || self.ran_with("install.ps1")) =>
+                {
+                    Some(Output {
+                        ok: true,
+                        text: "Hermes Agent v0.21.7 (2026.9.24)\n".into(),
+                    })
+                }
                 (_, ["auth", "list"]) if own => Some(Output {
                     ok: true,
                     text: if self.ran_with("auth add openai-codex") {
@@ -1310,7 +1594,7 @@ mod tests {
         }
 
         fn os(&self) -> Os {
-            Os::MacOs
+            self.os
         }
 
         fn uid(&self) -> u32 {
@@ -1332,6 +1616,7 @@ mod tests {
             exe: "/bin/octotrigger".into(),
             path_env: "/usr/bin:/bin".into(),
             machine: "test-mac".into(),
+            user: String::new(),
         };
         let own = &paths.own;
         let starter = config::starter("test-mac", Plan::ChatGpt, Agent::Own)
@@ -1356,6 +1641,7 @@ mod tests {
         (paths, auth_file)
     }
 
+    #[cfg(unix)]
     #[test]
     fn setup_takes_a_new_machine_from_nothing_to_a_running_watcher() {
         let dir = tempfile::tempdir().expect("dir");
@@ -1374,7 +1660,7 @@ mod tests {
         assert_eq!(
             ran,
             [
-                own_install_command(own),
+                own_install_command(Os::MacOs, own),
                 format!(
                     "HERMES_HOME={} {} auth add openai-codex",
                     own.home().display(),
@@ -1440,6 +1726,189 @@ mod tests {
         );
     }
 
+    /// The same setup on Windows: PowerShell lines, Hermes' Windows
+    /// installer with the PATH entry taken out again, and a Task Scheduler
+    /// task that runs a hidden launcher.
+    #[test]
+    fn setup_on_windows_uses_powershell_and_a_task_at_sign_in() {
+        let dir = tempfile::tempdir().expect("dir");
+        let home = dir.path();
+        let (mut paths, auth_file) = test_paths(home);
+        paths.exe = r"C:\Users\ann\AppData\Local\Programs\octotrigger\octotrigger.exe".into();
+        paths.user = r"PC\ann".into();
+        let mut fake = Fake::new(&paths, auth_file, &["", "", "", "yes", "", "", ""]);
+        fake.os = Os::Windows;
+        let finished = run(&mut fake, &paths, Choices::default()).expect("setup");
+        let said = fake.said.join("\n");
+        assert!(finished, "{said}");
+        let ran = fake.ran.borrow().clone();
+        let own = &paths.own;
+        let q = |path: &Path| Os::Windows.quote(&path.display().to_string());
+        let exe = format!("& '{}'", paths.exe);
+        assert_eq!(ran.len(), 5, "{ran:#?}");
+        assert!(ran[0].contains(&format!(
+            "/{HERMES_PIN}/scripts/install.ps1))) -Commit {HERMES_PIN} -InstallDir {} \
+             -HermesHome {} -NonInteractive -SkipBrowser -SkipComputerUse;",
+            q(&own.code()),
+            q(&own.home())
+        )));
+        assert!(
+            ran[0].contains("SetEnvironmentVariable('Path'")
+                && ran[0].contains(&q(&own.home().join("bin"))),
+            "the installer's PATH entry goes again: {}",
+            ran[0]
+        );
+        assert_eq!(
+            ran[1],
+            format!(
+                "$env:HERMES_HOME = {}; & {} auth add openai-codex",
+                q(&own.home()),
+                q(&own.program())
+            )
+        );
+        assert_eq!(ran[2], format!("{exe} --config {} login", q(&paths.config)));
+        assert_eq!(ran[3], format!("{exe} --config {} check", q(&paths.config)));
+        let task = home.join(".octotrigger").join("octotrigger.task.xml");
+        let launcher = home.join(".octotrigger").join("octotrigger.vbs");
+        assert!(
+            ran[4].starts_with(&format!(
+                "schtasks /Create /F /TN octotrigger /XML {} /RU 'PC\\ann' /NP /IT;",
+                q(&task)
+            )),
+            "{}",
+            ran[4]
+        );
+        assert!(ran[4].ends_with("schtasks /Run /TN octotrigger; exit $LASTEXITCODE"));
+        let bytes = std::fs::read(&task).expect("task");
+        assert_eq!(&bytes[..2], [0xFF, 0xFE], "UTF-16 with its byte order mark");
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let text = String::from_utf16(&units).expect("utf-16");
+        assert!(text.contains("<UserId>PC\\ann</UserId>"), "{text}");
+        assert!(
+            text.contains("<RunLevel>LeastPrivilege</RunLevel>"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("//B //Nologo \"{}\"", launcher.display())));
+        let vbs = std::fs::read_to_string(&launcher).expect("launcher");
+        assert!(
+            vbs.contains(&format!(
+                "WScript.Quit sh.Run(\"\"\"{}\"\" --config \"\"{}\"\" start\", 0, True)",
+                paths.exe,
+                paths.config.display()
+            )),
+            "{vbs}"
+        );
+
+        // Task Scheduler refuses: the Startup folder instead.
+        let other = tempfile::tempdir().expect("dir");
+        let (mut paths, auth_file) = test_paths(other.path());
+        paths.user = r"PC\ann".into();
+        std::fs::write(&auth_file, "").expect("auth");
+        let mut refused = Refusing(Fake::new(
+            &paths,
+            auth_file,
+            &["", "", "", "yes", "", "", "", ""],
+        ));
+        refused.0.os = Os::Windows;
+        assert!(run(&mut refused, &paths, Choices::default()).expect("setup"));
+        assert!(
+            refused
+                .0
+                .ran_with("[Environment]::GetFolderPath('Startup')")
+        );
+
+        // Uninstall: the task and the Startup copy go, with both files.
+        let mut out = Fake::new(&paths, other.path().join("unused"), &["n"]);
+        out.os = Os::Windows;
+        assert!(uninstall(&mut out, &paths, false).expect("uninstall"));
+        assert!(out.ran_with("schtasks /Delete /F /TN octotrigger"));
+        assert!(
+            !other
+                .path()
+                .join(".octotrigger/octotrigger.task.xml")
+                .exists()
+        );
+        assert!(!other.path().join(".octotrigger/octotrigger.vbs").exists());
+        assert!(out.said.join("\n").contains("Remove-Item -Recurse -Force"));
+    }
+
+    /// Task Scheduler takes the task file that setup writes. It registers a
+    /// real task (and deletes it), so only CI runs it:
+    /// `cargo test -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "registers a real Task Scheduler task"]
+    fn task_scheduler_takes_the_task_file() {
+        let dir = tempfile::tempdir().expect("dir");
+        let user = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").expect("USERDOMAIN"),
+            std::env::var("USERNAME").expect("USERNAME")
+        );
+        let launcher = dir.path().join("octotrigger.vbs");
+        std::fs::write(
+            &launcher,
+            windows_launcher(r"C:\none\octotrigger.exe", Path::new("c.yaml")),
+        )
+        .expect("launcher");
+        let task = dir.path().join("octotrigger.task.xml");
+        std::fs::write(&task, utf16_file(&task_xml(&launcher, &user))).expect("task");
+        let name = "octotrigger-test";
+        let schtasks = |args: &[&str]| {
+            std::process::Command::new("schtasks")
+                .args(args)
+                .output()
+                .expect("schtasks")
+        };
+        let xml = task.display().to_string();
+        let mut made = schtasks(&[
+            "/Create", "/F", "/TN", name, "/XML", &xml, "/RU", &user, "/NP", "/IT",
+        ]);
+        if !made.status.success() {
+            made = schtasks(&["/Create", "/F", "/TN", name, "/XML", &xml]);
+        }
+        assert!(
+            made.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&made.stdout),
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let query = schtasks(&["/Query", "/TN", name, "/XML"]);
+        let _ = schtasks(&["/Delete", "/F", "/TN", name]);
+        assert!(query.status.success());
+        let text = String::from_utf8_lossy(&query.stdout).replace('\0', "");
+        assert!(text.contains("LogonTrigger"), "{text}");
+    }
+
+    /// A machine whose Task Scheduler refuses the task.
+    struct Refusing(Fake);
+
+    impl Machine for Refusing {
+        fn output(&self, program: &str, args: &[&str], env: &[(&str, &str)]) -> Option<Output> {
+            self.0.output(program, args, env)
+        }
+        fn run(&mut self, line: &str) -> bool {
+            let ok = self.0.run(line);
+            ok && !line.starts_with("schtasks /Create")
+        }
+        fn ask(&mut self, question: &str) -> String {
+            self.0.ask(question)
+        }
+        fn say(&mut self, text: &str) {
+            self.0.say(text);
+        }
+        fn os(&self) -> Os {
+            self.0.os()
+        }
+        fn uid(&self) -> u32 {
+            0
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn setup_asks_which_hermes_and_stops_with_the_command_on_a_no() {
         let dir = tempfile::tempdir().expect("dir");
@@ -1454,7 +1923,10 @@ mod tests {
             "{said}"
         );
         assert!(
-            said.contains(&format!("Run: {}", own_install_command(&paths.own))),
+            said.contains(&format!(
+                "Run: {}",
+                own_install_command(Os::MacOs, &paths.own)
+            )),
             "{said}"
         );
         assert!(
@@ -1469,6 +1941,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_chat_with_no_terminal_drives_setup_with_flags() {
         let dir = tempfile::tempdir().expect("dir");
@@ -1530,6 +2003,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_persons_own_hermes_is_used_as_it_is() {
         let dir = tempfile::tempdir().expect("dir");

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Where the config lives when `--config` names no file.
 #[must_use]
 pub fn default_path() -> PathBuf {
-    home().join(".config/octotrigger/config.yaml")
+    expand(Path::new("~/.config/octotrigger/config.yaml"))
 }
 
 /// The environment variable that holds octotrigger's Toolscaled access
@@ -36,7 +36,7 @@ impl OwnHermes {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            root: home().join(OWN_HERMES_DIR),
+            root: expand(Path::new(&format!("~/{OWN_HERMES_DIR}"))),
         }
     }
 
@@ -46,10 +46,19 @@ impl OwnHermes {
         self.root.join("hermes-agent")
     }
 
-    /// The `hermes` command of this install.
+    /// The `hermes` command of this install. On Windows the installer
+    /// writes `hermes.exe`, or `hermes.cmd` when it cannot make an `.exe`.
     #[must_use]
     pub fn program(&self) -> PathBuf {
-        self.code().join(".hermes/bin/hermes")
+        let bin = self.code().join(".hermes").join("bin");
+        if cfg!(windows) {
+            let cmd = bin.join("hermes.cmd");
+            if cmd.exists() && !bin.join("hermes.exe").exists() {
+                return cmd;
+            }
+            return bin.join("hermes.exe");
+        }
+        bin.join("hermes")
     }
 
     /// Its `HERMES_HOME`.
@@ -74,14 +83,18 @@ impl Default for OwnHermes {
 /// The person's home folder.
 #[must_use]
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
+    crate::platform::home()
 }
 
 /// A path with a leading `~/` read as the home folder.
 #[must_use]
 pub fn expand(path: &Path) -> PathBuf {
     match path.to_str().and_then(|text| text.strip_prefix("~/")) {
-        Some(rest) => home().join(rest),
+        // Each part on its own, so a Windows path has one kind of separator.
+        Some(rest) => rest
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .fold(home(), |path, part| path.join(part)),
         None => path.to_path_buf(),
     }
 }
@@ -170,9 +183,13 @@ pub struct Job {
     pub lease_seconds: u32,
     #[serde(default = "default_run_timeout_minutes")]
     pub run_timeout_minutes: u64,
-    /// The command that runs one task and exits. `{prompt_file}`,
-    /// `{folder}` and `{usage_file}` are replaced; it runs with `sh -c` in
-    /// the run's folder.
+    /// The command that runs one task and exits, in the run's folder.
+    /// `{prompt}` is the run's start prompt as one word; `{prompt_file}`,
+    /// `{folder}` and `{usage_file}` are the run's files. On macOS and Linux
+    /// it runs with `sh -c`. On Windows it runs with no shell: octotrigger
+    /// splits it into words as Windows programs do (double quotes group a
+    /// word), replaces the names in each word, and starts the first word,
+    /// with `~/` read as the home folder.
     pub agent: String,
     /// Names removed from the agent's environment, such as
     /// `OPENAI_API_KEY` when the plan login must pay.
@@ -348,13 +365,7 @@ impl Config {
     /// The runner's name on the run page: the job's agent and the machine.
     #[must_use]
     pub fn runner_name(&self, job: &Job) -> String {
-        let agent = job
-            .agent
-            .split_whitespace()
-            .next()
-            .and_then(|program| Path::new(program).file_name())
-            .and_then(|name| name.to_str())
-            .unwrap_or("agent");
+        let agent = crate::agent::program_name(&job.agent).unwrap_or_else(|| "agent".to_owned());
         let name = format!("{agent} on {}", self.machine.trim());
         name.chars().take(120).collect()
     }
@@ -380,7 +391,7 @@ impl Plan {
     pub fn agent_command(self, program: &str) -> String {
         match self {
             Self::ChatGpt => format!(
-                "{program} -z \"$(cat {{prompt_file}})\"\n\
+                "{program} -z {{prompt}}\n\
                  \x20     --provider openai-codex -m gpt-6.1-terra\n\
                  \x20     -t toolscaled,file --usage-file {{usage_file}}"
             ),
@@ -412,20 +423,15 @@ impl Agent {
     /// a job that does not run Hermes.
     #[must_use]
     pub fn of_job(job: &Job, own: &OwnHermes) -> Option<Self> {
-        let home = own.home().display().to_string();
+        let home = own.home();
         if job
             .env_values()
             .iter()
-            .any(|(name, value)| name == "HERMES_HOME" && *value == home)
+            .any(|(name, value)| name == "HERMES_HOME" && Path::new(value) == home)
         {
             return Some(Self::Own);
         }
-        let program = job.agent.split_whitespace().next().unwrap_or_default();
-        (Path::new(program)
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some("hermes"))
-        .then_some(Self::Mine)
+        (crate::agent::program_name(&job.agent).as_deref() == Some("hermes")).then_some(Self::Mine)
     }
 }
 
@@ -451,7 +457,7 @@ pub fn starter(machine: &str, plan: Plan, agent: Agent) -> String {
     };
     format!(
         "# octotrigger config. The agent command runs one task and exits.\n\
-         # {{prompt_file}}: the run's start prompt from Toolscaled, word for word.\n\
+         # {{prompt}}: the run's start prompt from Toolscaled, word for word, as one word.\n\
          # {{folder}}: the run's own empty folder. {{usage_file}}: where the agent\n\
          {connection}\
          machine: {machine}\n\

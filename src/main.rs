@@ -208,14 +208,24 @@ fn load_or_defaults(path: &Path) -> Result<Endpoints> {
 
 /// The places of the guided setup.
 fn paths(config: PathBuf) -> Result<Paths> {
-    let machine = std::process::Command::new("hostname")
-        .arg("-s")
-        .output()
-        .ok()
-        .and_then(|out| String::from_utf8(out.stdout).ok())
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "my-machine".to_owned());
+    let machine = if cfg!(windows) {
+        std::env::var("COMPUTERNAME").ok()
+    } else {
+        std::process::Command::new("hostname")
+            .arg("-s")
+            .output()
+            .ok()
+            .and_then(|out| String::from_utf8(out.stdout).ok())
+    }
+    .map(|name| name.trim().to_lowercase())
+    .filter(|name| !name.is_empty())
+    .unwrap_or_else(|| "my-machine".to_owned());
+    // The Windows account the Task Scheduler task runs as.
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(domain), Ok(name)) if cfg!(windows) => format!("{domain}\\{name}"),
+        (_, Ok(name)) if cfg!(windows) => name,
+        _ => String::new(),
+    };
     Ok(Paths {
         config,
         own: config::OwnHermes::new(),
@@ -226,6 +236,7 @@ fn paths(config: PathBuf) -> Result<Paths> {
             .to_string(),
         path_env: std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_owned()),
         machine,
+        user,
     })
 }
 
@@ -260,12 +271,8 @@ fn check(config: &Config, with_agent: bool) -> Result<()> {
     }
     let mut failed = Vec::new();
     for job in &config.jobs {
-        let program = job.agent.split_whitespace().next().unwrap_or_default();
-        let found = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("command -v {program}"))
-            .output()
-            .is_ok_and(|out| out.status.success());
+        let program = agent::program_word(&job.agent);
+        let found = octotrigger::platform::find_program(&program).is_some();
         if !found {
             println!("Job {}: agent {program} NOT FOUND on PATH.", job.name);
             failed.push(job.name.clone());
@@ -332,7 +339,7 @@ fn agent_check(
                 break status;
             }
             if Instant::now() > deadline {
-                agent::kill_group(child.id());
+                child.kill();
                 let _ = child.wait();
                 bail!("the agent did not end in {CHECK_MINUTES} minutes");
             }

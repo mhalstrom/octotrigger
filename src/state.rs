@@ -66,14 +66,13 @@ impl State {
     ///
     /// A file that cannot be written.
     pub fn save(&self, path: &Path) -> Result<()> {
-        use std::os::unix::fs::PermissionsExt as _;
         if let Some(folder) = path.parent() {
             std::fs::create_dir_all(folder)?;
         }
         let partial = path.with_extension("json.partial");
         {
             let mut file = std::fs::File::create(&partial)?;
-            std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600))?;
+            crate::platform::make_private(&partial, false)?;
             file.write_all(&serde_json::to_vec_pretty(self)?)?;
             file.sync_all()?;
         }

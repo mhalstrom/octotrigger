@@ -17,7 +17,6 @@
 //!    nothing comes.
 
 use std::path::Path;
-use std::process::Child;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -75,7 +74,7 @@ pub fn write_stop(path: &Path, stop: Stop) -> Result<()> {
 struct Running {
     claim: Claim,
     job: usize,
-    child: Child,
+    child: agent::AgentProcess,
     folder: Folder,
     output: std::path::PathBuf,
     deadline: Instant,
@@ -218,7 +217,7 @@ impl<S: Surface> Runner<S> {
             }
             if now >= self.running[index].deadline {
                 let running = self.running.remove(index);
-                agent::kill_group(running.child.id());
+                running.child.kill();
                 let minutes = self.config.jobs[running.job].run_timeout_minutes;
                 self.finish(
                     running,
@@ -250,7 +249,7 @@ impl<S: Surface> Runner<S> {
                         // back: the agent's token stops working, and there is
                         // no claim left to end.
                         let mut running = self.running.remove(index);
-                        agent::kill_group(running.child.id());
+                        running.child.kill();
                         let _ = running.child.wait();
                         self.log.event(
                             "claim_ended",
@@ -470,7 +469,7 @@ impl<S: Surface> Runner<S> {
     fn stop_all(&mut self, why: &str) -> Result<()> {
         let running = std::mem::take(&mut self.running);
         for mut running in running {
-            agent::kill_group(running.child.id());
+            running.child.kill();
             let _ = running.child.wait();
             let _ = self.surface.release(
                 &running.claim.claim_token,

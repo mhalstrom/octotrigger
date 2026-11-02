@@ -5,6 +5,7 @@ pub mod agent;
 pub mod auth;
 pub mod config;
 pub mod log;
+pub mod platform;
 pub mod runner;
 pub mod setup;
 pub mod state;

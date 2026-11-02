@@ -1,6 +1,6 @@
 //! One agent process for one claimed run: its own empty folder, the run's
-//! start prompt in it, the command in its own process group, and its token
-//! use when it ends.
+//! start prompt in it, the command in a process tree of its own (a process
+//! group on Unix, a job object on Windows), and its token use when it ends.
 //!
 //! The agent reaches Toolscaled on octotrigger's own sign-in: octotrigger
 //! puts a fresh access token in the agent's environment
@@ -10,21 +10,25 @@
 
 use std::fs::File;
 use std::io::Write as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::config::{AGENT_TOKEN_ENV, Job};
+use crate::platform::{self, Tree};
 use crate::surface::{Claim, Usage};
+
+pub use crate::platform::{alive, kill_group};
 
 /// The files of a run's folder.
 pub struct Folder {
     pub path: PathBuf,
     pub prompt_file: PathBuf,
     pub usage_file: PathBuf,
+    /// The start prompt, as `{prompt}` gives it.
+    pub prompt: String,
 }
 
 /// Makes the run's folder, readable by the person only, with the start
@@ -34,87 +38,193 @@ pub struct Folder {
 ///
 /// A folder or file that cannot be written.
 pub fn prepare(work_dir: &Path, claim: &Claim) -> Result<Folder> {
-    use std::os::unix::fs::PermissionsExt as _;
     std::fs::create_dir_all(work_dir)?;
     let path = work_dir.join(format!("run-{}", claim.run_id));
     if path.exists() {
         std::fs::remove_dir_all(&path)?;
     }
     std::fs::create_dir_all(&path)?;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+    platform::make_private(&path, true)?;
     let prompt_file = path.join("prompt.txt");
     let mut handle = File::create(&prompt_file)?;
-    std::fs::set_permissions(&prompt_file, std::fs::Permissions::from_mode(0o600))?;
+    platform::make_private(&prompt_file, false)?;
     handle.write_all(claim.start_prompt.as_bytes())?;
     Ok(Folder {
         usage_file: path.join("usage.json"),
         prompt_file,
         path,
+        prompt: claim.start_prompt.clone(),
     })
 }
 
-/// The job's command with the run's files in place of `{prompt_file}`,
-/// `{folder}` and `{usage_file}`, each quoted for `sh`.
+/// The job's command for `sh -c` (Unix): `{prompt}` as one quoted word, and
+/// the run's files in place of `{prompt_file}`, `{folder}` and
+/// `{usage_file}`, each quoted.
 #[must_use]
 pub fn command_line(job: &Job, folder: &Folder) -> String {
     job.agent
-        .replace("{prompt_file}", &quote(&folder.prompt_file))
-        .replace("{folder}", &quote(&folder.path))
-        .replace("{usage_file}", &quote(&folder.usage_file))
+        .replace(
+            "{prompt_file}",
+            &quote(&folder.prompt_file.display().to_string()),
+        )
+        .replace("{folder}", &quote(&folder.path.display().to_string()))
+        .replace(
+            "{usage_file}",
+            &quote(&folder.usage_file.display().to_string()),
+        )
+        .replace("{prompt}", &quote(&folder.prompt))
 }
 
-fn quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+fn quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// Starts the agent in the run's folder, in a process group of its own, with
+/// The job's command as a program and its words (Windows): the line split
+/// as Windows programs read it, the names replaced in each word with no
+/// quoting, and the first word found as a program (`~/` read as the home
+/// folder; `.exe`, `.cmd` or `.bat` added when it has none).
+///
+/// # Errors
+///
+/// A line with no word.
+#[cfg(windows)]
+pub fn command_words(job: &Job, folder: &Folder) -> Result<(PathBuf, Vec<String>)> {
+    let words = platform::split_words(&job.agent)?;
+    let fill = |word: &str| {
+        word.replace("{prompt_file}", &folder.prompt_file.display().to_string())
+            .replace("{folder}", &folder.path.display().to_string())
+            .replace("{usage_file}", &folder.usage_file.display().to_string())
+            .replace("{prompt}", &folder.prompt)
+    };
+    let (program, args) = words.split_first().context("the agent command is empty")?;
+    let program = fill(program);
+    let found = platform::find_program(&program)
+        .unwrap_or_else(|| crate::config::expand(Path::new(&program)));
+    Ok((found, args.iter().map(|word| fill(word)).collect()))
+}
+
+/// The first word of an agent command: the program, as the person wrote it.
+#[must_use]
+pub fn program_word(line: &str) -> String {
+    #[cfg(windows)]
+    {
+        platform::split_words(line)
+            .ok()
+            .and_then(|words| words.into_iter().next())
+            .unwrap_or_default()
+    }
+    #[cfg(not(windows))]
+    {
+        line.split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+}
+
+/// The name of an agent command's program: its file name, with no `.exe`,
+/// `.cmd` or `.bat`.
+#[must_use]
+pub fn program_name(line: &str) -> Option<String> {
+    let word = program_word(line);
+    let path = Path::new(&word);
+    let windows = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| ["exe", "cmd", "bat"].contains(&e.to_ascii_lowercase().as_str()));
+    let name = if windows {
+        path.file_stem()
+    } else {
+        path.file_name()
+    };
+    name.and_then(|name| name.to_str()).map(str::to_owned)
+}
+
+/// A started agent: its process and its process tree.
+pub struct AgentProcess {
+    child: Child,
+    tree: Tree,
+}
+
+impl AgentProcess {
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Its exit, when it has ended.
+    ///
+    /// # Errors
+    ///
+    /// A process the system cannot read.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Waits for its end.
+    ///
+    /// # Errors
+    ///
+    /// A process the system cannot read.
+    pub fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.wait()
+    }
+
+    /// Kills the agent and every process it started.
+    pub fn kill(&self) {
+        self.tree.kill();
+    }
+}
+
+/// Starts the agent in the run's folder, in a process tree of its own, with
 /// its output in `output`, the job's `env`, and `token` as its Toolscaled
-/// access token.
+/// access token. On Unix the command runs with `sh -c`; on Windows with no
+/// shell ([`command_words`]).
 ///
 /// # Errors
 ///
 /// A command that cannot start.
-pub fn spawn(job: &Job, folder: &Folder, output: &Path, token: &str) -> Result<Child> {
+pub fn spawn(job: &Job, folder: &Folder, output: &Path, token: &str) -> Result<AgentProcess> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let log = File::create(output)?;
-    let mut command = Command::new("/bin/sh");
+    #[cfg(windows)]
+    let mut command = {
+        let (program, args) = command_words(job, folder)?;
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(command_line(job, folder));
+        command
+    };
     command
-        .arg("-c")
-        .arg(command_line(job, folder))
         .current_dir(&folder.path)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        .process_group(0);
+        .stderr(log);
+    platform::own_tree(&mut command);
     for name in &job.unset_env {
         command.env_remove(name);
     }
     command.envs(job.env_values());
     command.env(AGENT_TOKEN_ENV, token);
-    command
+    let child = command
         .spawn()
-        .with_context(|| format!("start the agent of job {}", job.name))
-}
-
-/// Stops a process group: the agent and every process it started.
-pub fn kill_group(pid: u32) {
-    if let Ok(pid) = i32::try_from(pid) {
-        // SAFETY: killpg sends a signal; it reads and writes no memory of ours.
-        unsafe {
-            libc::killpg(pid, libc::SIGKILL);
+        .with_context(|| format!("start the agent of job {}", job.name))?;
+    match Tree::of(&child) {
+        Ok(tree) => Ok(AgentProcess { child, tree }),
+        Err(error) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error).with_context(|| format!("hold the agent of job {}", job.name))
         }
     }
-}
-
-/// Whether a process still lives.
-#[must_use]
-pub fn alive(pid: u32) -> bool {
-    i32::try_from(pid).is_ok_and(|pid| {
-        // SAFETY: signal 0 checks the process and sends nothing.
-        unsafe { libc::kill(pid, 0) == 0 }
-    })
 }
 
 /// The agent's token use: the usage file when the agent wrote one, else the
@@ -206,7 +316,7 @@ mod tests {
     }
 
     fn job(agent: &str) -> Job {
-        serde_yaml::from_str(&format!("name: j\nagent: \"{agent}\"\n")).expect("job")
+        serde_json::from_value(serde_json::json!({"name": "j", "agent": agent})).expect("job")
     }
 
     #[test]
@@ -226,6 +336,72 @@ mod tests {
         assert!(line.contains("prompt.txt'"), "{line}");
     }
 
+    #[test]
+    fn the_prompt_is_one_word_however_it_is_written() {
+        let work = tempfile::tempdir().expect("work");
+        let mut claim = claim();
+        claim.start_prompt = "It's \"quoted\", $HOME and `x`.\nLine two.".into();
+        let folder = prepare(work.path(), &claim).expect("folder");
+        #[cfg(unix)]
+        {
+            let output = work.path().join("out.log");
+            let status = spawn(&job("printf '%s|' {prompt}"), &folder, &output, "t")
+                .expect("spawn")
+                .wait()
+                .expect("wait");
+            assert!(status.success());
+            let text = std::fs::read_to_string(&output).expect("output");
+            assert_eq!(text, format!("{}|", claim.start_prompt), "{text}");
+        }
+        #[cfg(windows)]
+        {
+            let (_, args) = command_words(
+                &job(r#"hermes -z {prompt} -m "claude-sonnet-5-5[1m]" --usage-file {usage_file}"#),
+                &folder,
+            )
+            .expect("words");
+            assert_eq!(
+                args,
+                [
+                    "-z".to_owned(),
+                    claim.start_prompt.clone(),
+                    "-m".to_owned(),
+                    "claude-sonnet-5-5[1m]".to_owned(),
+                    "--usage-file".to_owned(),
+                    folder.usage_file.display().to_string(),
+                ]
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_agent_runs_in_its_folder_without_the_unset_names() {
+        let work = tempfile::tempdir().expect("work");
+        let folder = prepare(work.path(), &claim()).expect("folder");
+        let mut job = job(
+            r#"powershell.exe -NoProfile -Command "(Get-Location).Path; 'key=' + $env:OCTO_TEST_KEY + ' home=' + $env:OCTO_TEST_HOME + ' token=' + $env:OCTOTRIGGER_TOOLSCALED_TOKEN""#,
+        );
+        job.unset_env = vec!["OCTO_TEST_KEY".into()];
+        job.env
+            .insert("OCTO_TEST_HOME".into(), "~/agent-home".into());
+        // SAFETY: the test sets a name only it reads.
+        unsafe { std::env::set_var("OCTO_TEST_KEY", "secret") };
+        let output = work.path().join("out.log");
+        let status = spawn(&job, &folder, &output, "run-token")
+            .expect("spawn")
+            .wait()
+            .expect("wait");
+        assert!(status.success());
+        let text = std::fs::read_to_string(&output).expect("output");
+        assert!(text.contains("run-r1"), "{text}");
+        assert!(text.contains("key= "), "{text}");
+        let home = crate::config::home().join("agent-home");
+        assert!(text.contains(&format!("home={}", home.display())), "{text}");
+        assert!(text.contains("token=run-token"), "{text}");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn the_agent_runs_in_its_folder_without_the_unset_names() {
         let work = tempfile::tempdir().expect("work");

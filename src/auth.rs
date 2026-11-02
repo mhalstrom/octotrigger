@@ -316,8 +316,7 @@ pub fn save(path: &Path, tokens: &Tokens) -> Result<()> {
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    crate::platform::make_private(path, mode == 0o700)?;
     Ok(())
 }
 
@@ -395,11 +394,10 @@ pub fn fresh_for(path: &Path, seconds: i64) -> Result<Tokens> {
 }
 
 /// An exclusive lock on a file, held until it is dropped.
-struct Lock(std::fs::File);
+struct Lock(#[allow(dead_code)] crate::platform::FileLock);
 
 impl Lock {
     fn take(path: &Path) -> Result<Self> {
-        use std::os::fd::AsRawFd as _;
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -407,25 +405,9 @@ impl Lock {
             .open(path)
             .with_context(|| format!("open the lock {}", path.display()))?;
         set_mode(path, 0o600)?;
-        // SAFETY: flock takes the descriptor of a file this value owns.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            bail!(
-                "lock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            );
-        }
-        Ok(Self(file))
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-        // SAFETY: as in take; the file stays open until after this call.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
+        crate::platform::FileLock::take(file)
+            .map(Self)
+            .with_context(|| format!("lock {}", path.display()))
     }
 }
 
@@ -460,6 +442,7 @@ mod tests {
         assert_eq!(json_of("{\"id\":3}").expect("json")["id"], 3);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_auth_file_is_readable_by_the_person_only() {
         use std::os::unix::fs::PermissionsExt as _;

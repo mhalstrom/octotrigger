@@ -1,0 +1,62 @@
+# A tag v<version> builds octotrigger for Windows (x64 and Arm64), puts each
+# zip and its SHA-256 on the GitHub release of the tag, and then installs the
+# release with install.ps1 on both, as a person does.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Zip and SHA-256
+        shell: pwsh
+        run: |
+          $name = "octotrigger-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/octotrigger.exe" -DestinationPath $name
+          $hash = (Get-FileHash -Algorithm SHA256 $name).Hash.ToLower()
+          Set-Content -NoNewline -Path "$name.sha256" -Value "$hash  $name"
+      - name: Upload to the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes "octotrigger $GITHUB_REF_NAME" \
+            || gh release view "$GITHUB_REF_NAME" >/dev/null
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            "octotrigger-${{ matrix.target }}.zip" "octotrigger-${{ matrix.target }}.zip.sha256"
+
+  install:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: The one-line install, in Windows PowerShell as a person runs it
+        shell: powershell
+        run: |
+          irm "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/install.ps1" | iex
+          octotrigger --version

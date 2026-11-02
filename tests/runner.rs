@@ -10,7 +10,6 @@ use std::time::Duration;
 use anyhow::Result;
 use octotrigger::config::Config;
 use octotrigger::runner::{Runner, Stop, write_stop};
-use octotrigger::state::{Held, State};
 use octotrigger::surface::{Claim, Outcome, Refused, Surface, Usage};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,12 +112,20 @@ fn config(dir: &Path, agent: &str, extra: &str) -> Config {
          \x20   lease_seconds: 60\n\
          \x20   run_timeout_minutes: 5\n\
          \x20   agent: '{agent}'\n",
-        d = dir.display()
+        d = dir.display(),
+        agent = agent.replace('\'', "''"),
     );
     let config: Config = serde_yaml::from_str(&text).expect("config");
     config.check().expect("check");
     config
 }
+
+/// An agent that works until it is stopped.
+const SLEEPER: &str = if cfg!(windows) {
+    r#"powershell.exe -NoProfile -Command "Start-Sleep -Seconds 30""#
+} else {
+    "sleep 30"
+};
 
 fn runner(dir: &Path, agent: &str, extra: &str, fake: &Arc<Fake>) -> Runner<Arc<Fake>> {
     let mut runner = Runner::new(config(dir, agent, extra), Arc::clone(fake)).expect("runner");
@@ -144,14 +151,19 @@ fn a_claimed_run_starts_the_agent_and_ends_with_its_usage() {
     let dir = tempfile::tempdir().expect("dir");
     let fake = Arc::new(Fake::default());
     fake.waiting.lock().expect("lock").push_back(claim(1));
-    let agent = r#"test "$OCTOTRIGGER_TOOLSCALED_TOKEN" = agent-token && cat {prompt_file} | grep -q "Nobody reads this chat" && echo "{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100,\"output_tokens\":7}}""#;
+    let agent = if cfg!(windows) {
+        r#"powershell.exe -NoProfile -Command "if ($env:OCTOTRIGGER_TOOLSCALED_TOKEN -ne 'agent-token') { exit 1 }; if (-not ((Get-Content -Raw '{prompt_file}') -match 'Nobody reads this chat')) { exit 2 }; '{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100,\"output_tokens\":7}}'""#
+    } else {
+        r#"test "$OCTOTRIGGER_TOOLSCALED_TOKEN" = agent-token && cat {prompt_file} | grep -q "Nobody reads this chat" && echo "{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100,\"output_tokens\":7}}""#
+    };
     let mut runner = runner(dir.path(), agent, "", &fake);
 
     runner.step().expect("step");
     assert_eq!(runner.running(), 1);
     let (workflows, name, lease) = fake.claims.lock().expect("lock")[0].clone();
     assert!(workflows.is_empty(), "a job of all workflows names none");
-    assert_eq!(name, "test on test");
+    let program = if cfg!(windows) { "powershell" } else { "test" };
+    assert_eq!(name, format!("{program} on test"));
     assert_eq!(lease, 60);
     assert_eq!(runner.state().claims.len(), 1);
 
@@ -179,7 +191,7 @@ fn a_working_agent_renews_and_one_past_its_time_is_stopped() {
     let dir = tempfile::tempdir().expect("dir");
     let fake = Arc::new(Fake::default());
     fake.waiting.lock().expect("lock").push_back(claim(2));
-    let mut runner = runner(dir.path(), "sleep 30", "", &fake);
+    let mut runner = runner(dir.path(), SLEEPER, "", &fake);
 
     runner.step().expect("step");
     step_until(&mut runner, |_| {
@@ -206,8 +218,12 @@ fn a_working_agent_renews_and_one_past_its_time_is_stopped() {
     );
 }
 
+/// On Unix. On Windows the agents of an earlier start ended with it: their
+/// job object closed when that octotrigger ended.
+#[cfg(unix)]
 #[test]
 fn a_restart_stops_the_agent_of_the_last_start_and_ends_its_claim() {
+    use octotrigger::state::{Held, State};
     let dir = tempfile::tempdir().expect("dir");
     let fake = Arc::new(Fake::default());
     // The agent a previous start left: a process group of its own.
@@ -256,7 +272,7 @@ fn the_stop_file_drains_and_stop_now_stops_the_agents() {
     let fake = Arc::new(Fake::default());
     fake.waiting.lock().expect("lock").push_back(claim(3));
     fake.waiting.lock().expect("lock").push_back(claim(4));
-    let mut runner = runner(dir.path(), "sleep 30", "", &fake);
+    let mut runner = runner(dir.path(), SLEEPER, "", &fake);
     let stop_file = dir.path().join("stop");
 
     runner.step().expect("step");
@@ -309,7 +325,7 @@ fn a_claim_that_ended_on_the_server_stops_its_agent_without_a_release() {
     let dir = tempfile::tempdir().expect("dir");
     let fake = Arc::new(Fake::default());
     fake.waiting.lock().expect("lock").push_back(claim(7));
-    let mut runner = runner(dir.path(), "sleep 30", "", &fake);
+    let mut runner = runner(dir.path(), SLEEPER, "", &fake);
 
     runner.step().expect("step");
     let pid = runner.state().claims[0].pid;
