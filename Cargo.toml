@@ -1,0 +1,31 @@
+[package]
+name = "octotrigger"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Claims Toolscaled runs that wait for an agent and starts your own agent CLI on each."
+repository = "https://github.com/mhalstrom/octotrigger"
+publish = false
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+open = "5"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tiny_http = "0.12"
+ureq = { version = "2", features = ["json"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true
