@@ -15,21 +15,19 @@
 //! pick only, is their own Hermes setup.
 //!
 //! The steps: Hermes (two steps for either choice), the model login (a
-//! ChatGPT plan, or a Claude plan as the second choice), the config,
+//! ChatGPT plan), the config,
 //! octotrigger's sign-in to Toolscaled, the token warning, the check, and
 //! how to keep the watcher running.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use serde_json::Value;
 
 use crate::TOKEN_WARNING;
 use crate::agent::alive;
 use crate::auth::{self, MCP_SCOPE};
 use crate::config::{
-    self, AGENT_TOKEN_ENV, Agent, CLAUDE_PROVIDER, Config, OwnHermes, Plan, Toolscaled, expand,
-    hermes_config,
+    self, AGENT_TOKEN_ENV, Agent, Config, OwnHermes, Plan, Toolscaled, expand, hermes_config,
 };
 use crate::state::{State, today};
 
@@ -41,8 +39,17 @@ pub const HERMES_PIN: &str = "71d34bad1045610252eda02ee79549436896e784";
 /// Hermes' own install command (its README), for a person's own setup.
 pub const HERMES_INSTALL: &str =
     "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash";
-/// The Hermes plugin of the Claude plan route.
-pub const CLAUDE_PLUGIN: &str = "claude-subscription-directsdk";
+/// The Hermes plugin that signs in with a Claude plan. Anthropic does not
+/// permit a third-party tool to route requests through a Claude plan's
+/// sign-in, so setup offers no Claude plan and names the plugin in a job of
+/// an older config.
+const CLAUDE_PLAN_PLUGIN: &str = "claude-subscription-directsdk";
+
+/// Why setup offers no Claude plan, with the words of Anthropic's page.
+const NO_CLAUDE_PLAN: &str = "A Claude plan is not offered: Anthropic's terms for Claude Code \
+     say \"Anthropic does not permit third-party developers to offer Claude.ai login into their \
+     own applications, or to route requests through Free, Pro, Max, or Ultra plan credentials \
+     on behalf of their users\" (code.claude.com/docs/en/legal-and-compliance).";
 /// The label of the launchd file.
 pub const LAUNCHD_LABEL: &str = "com.octotrigger.watcher";
 
@@ -531,7 +538,20 @@ impl<M: Machine> Setup<'_, M> {
     }
 
     fn plan(&mut self) -> Plan {
-        let from_config = Config::load(&self.p.config).ok().and_then(|config| {
+        let config = Config::load(&self.p.config).ok();
+        // A job of an older config that signs in with a Claude plan.
+        if config.as_ref().is_some_and(|config| {
+            config
+                .jobs
+                .iter()
+                .any(|job| job.agent.contains(CLAUDE_PLAN_PLUGIN))
+        }) {
+            self.m.say(&format!(
+                "  Your config has a job on a Claude plan. {NO_CLAUDE_PLAN} Change the job's \
+                 agent to a ChatGPT plan or to your own API key."
+            ));
+        }
+        let from_config = config.and_then(|config| {
             config
                 .jobs
                 .iter()
@@ -540,21 +560,11 @@ impl<M: Machine> Setup<'_, M> {
         if let Some(plan) = from_config.or(self.c.plan) {
             return plan;
         }
-        if self.c.yes {
-            return Plan::ChatGpt;
-        }
-        self.m.say("Which plan pays for the agent's model?");
-        self.m
-            .say("  1  A ChatGPT plan: GPT-6.1 Terra (tested with octotrigger).");
-        self.m
-            .say("  2  A Claude plan: Claude Sonnet 5.5, through a Hermes plugin.");
-        loop {
-            match self.m.ask("  Type 1 or 2 [1]").as_str() {
-                "" | "1" => return Plan::ChatGpt,
-                "2" => return Plan::Claude,
-                _ => {}
-            }
-        }
+        self.m.say(
+            "The agent's model: GPT-6.1 Terra on your ChatGPT plan (tested with octotrigger).",
+        );
+        self.m.say(&format!("  {NO_CLAUDE_PLAN}"));
+        Plan::ChatGpt
     }
 
     // 3
@@ -579,44 +589,6 @@ impl<M: Machine> Setup<'_, M> {
                         .then(|| "Hermes has an openai-codex login.".to_owned())
                 })
             }
-            Plan::Claude => {
-                self.title(3, "The Claude login of the agents' Hermes");
-                let home = hermes
-                    .home
-                    .as_ref()
-                    .map_or_else(|| self.p.home.join(".hermes"), PathBuf::from);
-                if !plugin_enabled(&home) {
-                    let installed = home.join("plugins").join(CLAUDE_PROVIDER).exists();
-                    let command = if installed {
-                        hermes.line(&format!("plugins enable {CLAUDE_PROVIDER}"))
-                    } else {
-                        hermes.line(&format!("plugins install {CLAUDE_PLUGIN}"))
-                    };
-                    let step =
-                        self.fix("the agents' Hermes has no Claude plugin.", &command, |_| {
-                            plugin_enabled(&home).then(|| "the Claude plugin is on.".to_owned())
-                        });
-                    if matches!(step, Step::Stop) {
-                        return step;
-                    }
-                }
-                if claude_login(&*self.m) {
-                    return self.done("Claude Code is signed in with a claude.ai account.");
-                }
-                self.m.say(
-                    "  Sign in with your claude.ai account. Then turn off extra usage in your \
-                     claude.ai settings, so a run that goes wrong stops at your plan's limit.",
-                );
-                self.fix(
-                    "Claude Code is not signed in with a claude.ai account.",
-                    "claude auth login",
-                    |me| {
-                        claude_login(&*me.m).then(|| {
-                            "Claude Code is signed in with a claude.ai account.".to_owned()
-                        })
-                    },
-                )
-            }
         }
     }
 
@@ -633,7 +605,6 @@ impl<M: Machine> Setup<'_, M> {
                 self.p.config.display(),
                 match plan {
                     Plan::ChatGpt => "GPT-6.1 Terra on your ChatGPT plan",
-                    Plan::Claude => "Claude Sonnet 5.5 on your Claude plan",
                 }
             )));
         }
@@ -1013,35 +984,6 @@ pub fn has_codex_login(text: &str) -> bool {
     false
 }
 
-/// Whether `claude auth status` names a claude.ai login (not an API key).
-#[must_use]
-pub fn has_claude_login(text: &str) -> bool {
-    serde_json::from_str::<Value>(text.trim()).is_ok_and(|value| {
-        value["loggedIn"].as_bool() == Some(true)
-            && value["authMethod"].as_str() == Some("claude.ai")
-    })
-}
-
-fn claude_login(m: &impl Machine) -> bool {
-    m.output("claude", &["auth", "status"], &[])
-        .is_some_and(|out| has_claude_login(&out.text))
-}
-
-/// Whether the Hermes home has the Claude plugin installed and on.
-#[must_use]
-pub fn plugin_enabled(hermes_home: &Path) -> bool {
-    hermes_home.join("plugins").join(CLAUDE_PROVIDER).exists()
-        && std::fs::read_to_string(hermes_home.join("config.yaml"))
-            .ok()
-            .and_then(|text| serde_yaml::from_str::<serde_yaml::Value>(&text).ok())
-            .and_then(|value| value["plugins"]["enabled"].as_sequence().cloned())
-            .is_some_and(|names| {
-                names
-                    .iter()
-                    .any(|name| name.as_str() == Some(CLAUDE_PROVIDER))
-            })
-}
-
 /// A path with the home folder written as `~`.
 fn home_relative(path: &Path, home: &Path) -> String {
     path.strip_prefix(home).map_or_else(
@@ -1193,7 +1135,7 @@ pub fn need_terminal() -> Result<()> {
     if unsafe { libc::isatty(0) } == 0 {
         bail!(
             "this command asks questions: run it in a terminal, or give the answers as flags \
-             (octotrigger setup --yes [--agent own|mine] [--plan chatgpt|claude] \
+             (octotrigger setup --yes [--agent own|mine] [--plan chatgpt] \
              [--accept-token-warning])"
         );
     }
@@ -1224,18 +1166,6 @@ mod tests {
         let without = "copilot (1 credentials):\n  #1  gh auth token  api_key id=1 ←\n\n\
                        nous (1 credentials):\n  #1  someone oauth   id=3 device_code ←\n";
         assert!(!has_codex_login(without));
-    }
-
-    #[test]
-    fn a_claude_login_is_a_claude_ai_login() {
-        assert!(has_claude_login(
-            r#"{"loggedIn": true, "authMethod": "claude.ai"}"#
-        ));
-        assert!(!has_claude_login(
-            r#"{"loggedIn": true, "authMethod": "apiKey"}"#
-        ));
-        assert!(!has_claude_login(r#"{"loggedIn": false}"#));
-        assert!(!has_claude_login("not json"));
     }
 
     #[test]

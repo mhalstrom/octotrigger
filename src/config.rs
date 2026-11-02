@@ -365,22 +365,13 @@ impl Config {
 pub enum Plan {
     /// A ChatGPT plan, through Hermes' `openai-codex` login.
     ChatGpt,
-    /// A Claude plan, through the Hermes plugin
-    /// `claude-subscription-directsdk` and the Claude Code login.
-    Claude,
 }
 
 impl Plan {
     /// The plan of a job command, from its `--provider`.
     #[must_use]
     pub fn of_command(agent: &str) -> Option<Self> {
-        if agent.contains("openai-codex") {
-            Some(Self::ChatGpt)
-        } else if agent.contains(CLAUDE_PROVIDER) {
-            Some(Self::Claude)
-        } else {
-            None
-        }
+        agent.contains("openai-codex").then_some(Self::ChatGpt)
     }
 
     /// The Hermes command of a job on this plan, with `program` as the
@@ -393,11 +384,6 @@ impl Plan {
                  \x20     --provider openai-codex -m gpt-6.1-terra\n\
                  \x20     -t toolscaled,file --usage-file {{usage_file}}"
             ),
-            Self::Claude => format!(
-                "{program} -z \"$(cat {{prompt_file}})\"\n\
-                 \x20     --provider {CLAUDE_PROVIDER} -m 'claude-sonnet-5-5[1m]'\n\
-                 \x20     -t toolscaled,file --usage-file {{usage_file}}"
-            ),
         }
     }
 
@@ -406,13 +392,9 @@ impl Plan {
     pub const fn api_key(self) -> &'static str {
         match self {
             Self::ChatGpt => "OPENAI_API_KEY",
-            Self::Claude => "ANTHROPIC_API_KEY",
         }
     }
 }
-
-/// The Hermes provider of the Claude plugin.
-pub const CLAUDE_PROVIDER: &str = "claude-subscription-directsdk-experimental";
 
 /// Which Hermes runs the agents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -527,7 +509,8 @@ mod tests {
 
     #[test]
     fn the_starter_config_reads_and_checks() {
-        for plan in [Plan::ChatGpt, Plan::Claude] {
+        {
+            let plan = Plan::ChatGpt;
             let config: Config =
                 serde_yaml::from_str(&starter("test-machine", plan, Agent::Own)).expect("reads");
             config.check().expect("checks");
@@ -558,10 +541,6 @@ mod tests {
             assert!(job.agent.starts_with("hermes -z"), "{}", job.agent);
             assert_eq!(Agent::of_job(job, &OwnHermes::new()), Some(Agent::Mine));
         }
-        assert!(
-            starter("m", Plan::Claude, Agent::Own).contains("-m 'claude-sonnet-5-5[1m]'"),
-            "the Claude model is a full id"
-        );
     }
 
     #[test]

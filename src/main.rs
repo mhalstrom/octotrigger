@@ -33,7 +33,6 @@ enum AgentChoice {
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum PlanChoice {
     Chatgpt,
-    Claude,
 }
 
 #[derive(Subcommand)]
@@ -56,7 +55,7 @@ enum Command {
         /// Which Hermes runs the agents: octotrigger's own (default) or mine.
         #[arg(long, value_enum)]
         agent: Option<AgentChoice>,
-        /// Which plan pays for the model: chatgpt (default) or claude.
+        /// Which plan pays for the model: chatgpt.
         #[arg(long, value_enum)]
         plan: Option<PlanChoice>,
         /// The person read the token warning and confirms it.
@@ -110,7 +109,6 @@ fn main() -> Result<()> {
                 }),
                 plan: plan.map(|choice| match choice {
                     PlanChoice::Chatgpt => config::Plan::ChatGpt,
-                    PlanChoice::Claude => config::Plan::Claude,
                 }),
                 accept_token_warning,
             };
