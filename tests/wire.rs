@@ -57,6 +57,7 @@ fn signed_in(dir: &std::path::Path) -> std::path::PathBuf {
             expires_at: chrono::Utc::now().timestamp() + 3600,
             scope: "mcp:connect".into(),
             organization_id: "org-1".into(),
+            organization_name: None,
             token_endpoint: "http://127.0.0.1:9/token".into(),
             resource: "http://127.0.0.1:9/mcp".into(),
         },

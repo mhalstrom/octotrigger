@@ -683,14 +683,19 @@ impl<M: Machine> Setup<'_, M> {
                     tokens.scope.split_whitespace().any(|s| s == MCP_SCOPE)
                         && tokens.resource == toolscaled.mcp_url
                 })
-                .map(|tokens| {
-                    format!(
+                .map(|tokens| match &tokens.organization_name {
+                    Some(_) => format!(
+                        "signed in to workspace {}. To use another workspace, sign in again: \
+                         {login}",
+                        tokens.workspace(),
+                    ),
+                    None => format!(
                         "signed in to workspace {id}: its page {base}/org/{id}/workflows shows \
                          its name. To use another workspace, sign in again: {login}",
                         id = tokens.organization_id,
                         login = login,
                         base = toolscaled.base_url.trim_end_matches('/'),
-                    )
+                    ),
                 })
         };
         if let Some(text) = signed_in(&file) {
@@ -1356,6 +1361,7 @@ mod tests {
                     expires_at: chrono::Utc::now().timestamp() + 3600,
                     scope: MCP_SCOPE.into(),
                     organization_id: "org-1".into(),
+                    organization_name: None,
                     token_endpoint: "http://127.0.0.1:1/token".into(),
                     resource: Toolscaled::default().mcp_url,
                 };

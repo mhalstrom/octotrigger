@@ -32,8 +32,23 @@ pub struct Tokens {
     pub scope: String,
     /// The workspace the person chose on the consent page.
     pub organization_id: String,
+    /// Its name, from Toolscaled's `inspect`; a sign-in from before
+    /// Toolscaled named it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_name: Option<String>,
     pub token_endpoint: String,
     pub resource: String,
+}
+
+impl Tokens {
+    /// The workspace as a person reads it: its name and id, or the id alone.
+    #[must_use]
+    pub fn workspace(&self) -> String {
+        match &self.organization_name {
+            Some(name) => format!("{name} ({})", self.organization_id),
+            None => self.organization_id.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -153,7 +168,7 @@ pub fn login(
         ])
         .context("exchange the sign-in code")?
         .into_json()?;
-    let organization_id = workspace_of(&http, mcp_url, &answer.access_token)?;
+    let (organization_id, organization_name) = workspace_of(&http, mcp_url, &answer.access_token)?;
     let tokens = Tokens {
         client_id,
         access_token: answer.access_token,
@@ -161,6 +176,7 @@ pub fn login(
         expires_at: now() + answer.expires_in,
         scope: answer.scope.unwrap_or_else(|| scope.to_owned()),
         organization_id,
+        organization_name,
         token_endpoint: metadata.token_endpoint,
         resource: mcp_url.to_owned(),
     };
@@ -214,7 +230,11 @@ fn wait_for_code(server: &tiny_http::Server, state: &str) -> Result<String> {
 }
 
 /// The workspace of a token, read from the MCP `inspect` answer.
-fn workspace_of(http: &ureq::Agent, mcp_url: &str, access_token: &str) -> Result<String> {
+fn workspace_of(
+    http: &ureq::Agent,
+    mcp_url: &str,
+    access_token: &str,
+) -> Result<(String, Option<String>)> {
     let bearer = format!("Bearer {access_token}");
     let post = |body: Value, session: Option<&str>| -> Result<(Value, Option<String>)> {
         let mut request = http
@@ -244,11 +264,22 @@ fn workspace_of(http: &ureq::Agent, mcp_url: &str, access_token: &str) -> Result
         session.as_deref(),
     )
     .context("read the workspace of the sign-in")?;
-    answer
-        .pointer("/result/structuredContent/state/identity/organization_id")
+    let identity = answer
+        .pointer("/result/structuredContent/state/identity")
+        .ok_or_else(|| anyhow!("the sign-in names no workspace"))?;
+    let id = identity
+        .get("organization_id")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| anyhow!("the sign-in names no workspace"))
+        .ok_or_else(|| anyhow!("the sign-in names no workspace"))?;
+    // Toolscaled names it since e23d08fd2; an older server names no name.
+    let name = identity
+        .get("organization_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    Ok((id, name))
 }
 
 /// A JSON answer, or the last `data:` line of an event stream.
@@ -441,6 +472,7 @@ mod tests {
             expires_at: now() + 3600,
             scope: MCP_SCOPE.into(),
             organization_id: "o".into(),
+            organization_name: None,
             token_endpoint: "http://127.0.0.1:1/token".into(),
             resource: "http://127.0.0.1:1/mcp".into(),
         };
@@ -459,5 +491,31 @@ mod tests {
         // One that ends sooner than a run needs is refreshed; this token
         // endpoint does not answer, so the refresh fails.
         assert!(fresh_for(&path, 7_200).is_err());
+    }
+
+    /// #4171: the workspace reads by its name and id, or by its id when the
+    /// sign-in has no name.
+    #[test]
+    fn the_workspace_reads_by_name_when_there_is_one() {
+        let named: Tokens = serde_json::from_value(serde_json::json!({
+            "client_id": "c", "access_token": "a", "refresh_token": "r", "expires_at": 0,
+            "scope": "mcp:connect", "organization_id": "org-1", "organization_name": "Acme",
+            "token_endpoint": "t", "resource": "r"
+        }))
+        .expect("named");
+        assert_eq!(named.workspace(), "Acme (org-1)");
+        // A sign-in file from before the name reads as it did.
+        let unnamed: Tokens = serde_json::from_value(serde_json::json!({
+            "client_id": "c", "access_token": "a", "refresh_token": "r", "expires_at": 0,
+            "scope": "mcp:connect", "organization_id": "org-1",
+            "token_endpoint": "t", "resource": "r"
+        }))
+        .expect("unnamed");
+        assert_eq!(unnamed.workspace(), "org-1");
+        assert!(
+            !serde_json::to_string(&unnamed)
+                .expect("json")
+                .contains("organization_name")
+        );
     }
 }

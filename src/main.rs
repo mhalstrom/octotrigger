@@ -128,13 +128,21 @@ fn main() -> Result<()> {
                 &expand(&config.auth_file),
                 !no_browser,
             )?;
-            println!(
-                "Signed in: workspace {id}, scope {scope}. Its page {base}/org/{id}/workflows \
-                 shows its name.",
-                id = tokens.organization_id,
-                scope = tokens.scope,
-                base = config.base_url.trim_end_matches('/'),
-            );
+            if tokens.organization_name.is_some() {
+                println!(
+                    "Signed in: workspace {}, scope {}.",
+                    tokens.workspace(),
+                    tokens.scope
+                );
+            } else {
+                println!(
+                    "Signed in: workspace {id}, scope {scope}. Its page {base}/org/{id}/workflows \
+                     shows its name.",
+                    id = tokens.organization_id,
+                    scope = tokens.scope,
+                    base = config.base_url.trim_end_matches('/'),
+                );
+            }
             Ok(())
         }
         Command::Check { no_agent } => check(&Config::load(&path)?, !no_agent),
@@ -238,7 +246,8 @@ fn check(config: &Config, with_agent: bool) -> Result<()> {
     let tokens = auth::access_token(&auth_file, false).context("the sign-in")?;
     println!(
         "Sign-in: workspace {}, scope {}.",
-        tokens.organization_id, tokens.scope
+        tokens.workspace(),
+        tokens.scope
     );
     // A dry claim: a workflow id that names no workflow takes nothing.
     let surface = HttpSurface::new(&config.toolscaled.base_url, auth_file);
