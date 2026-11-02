@@ -2,6 +2,7 @@
 //! how many at once, and the limits. It holds no instruction text: the
 //! prompt of each run comes from Toolscaled.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -11,6 +12,19 @@ use serde::{Deserialize, Serialize};
 #[must_use]
 pub fn default_path() -> PathBuf {
     home().join(".config/octotrigger/config.yaml")
+}
+
+/// The environment variable that holds octotrigger's Toolscaled access
+/// token for one run's agent. octotrigger sets it on the agent process only,
+/// fresh for each run; the agent's MCP config names it, never the token.
+pub const AGENT_TOKEN_ENV: &str = "OCTOTRIGGER_TOOLSCALED_TOKEN";
+
+/// The Hermes home of the agents that octotrigger starts: its own config,
+/// with the Toolscaled server on octotrigger's sign-in, and its own model
+/// login. The person's own Hermes (`~/.hermes`) stays as it is.
+#[must_use]
+pub fn hermes_home() -> PathBuf {
+    home().join(".config/octotrigger/hermes")
 }
 
 /// The person's home folder.
@@ -120,6 +134,21 @@ pub struct Job {
     /// `OPENAI_API_KEY` when the plan login must pay.
     #[serde(default)]
     pub unset_env: Vec<String>,
+    /// Names set in the agent's environment, such as `HERMES_HOME`. A value
+    /// that starts with `~/` is read from the home folder.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+}
+
+impl Job {
+    /// The job's `env`, with `~/` read as the home folder.
+    #[must_use]
+    pub fn env_values(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .map(|(name, value)| (name.clone(), expand(Path::new(value)).display().to_string()))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -201,6 +230,10 @@ const fn default_run_timeout_minutes() -> u64 {
     20
 }
 
+/// The longest run: the agent's access token (one hour) must outlive it,
+/// with five minutes to spare.
+pub const MAX_RUN_MINUTES: u64 = 50;
+
 impl Config {
     /// Reads and checks the config file.
     ///
@@ -242,8 +275,18 @@ impl Config {
             if job.max_concurrent == 0 {
                 bail!("job {}: max_concurrent is at least 1", job.name);
             }
-            if job.run_timeout_minutes == 0 {
-                bail!("job {}: run_timeout_minutes is at least 1", job.name);
+            if !(1..=MAX_RUN_MINUTES).contains(&job.run_timeout_minutes) {
+                bail!(
+                    "job {}: run_timeout_minutes is 1 to {MAX_RUN_MINUTES}: the agent's \
+                     Toolscaled token lives one hour",
+                    job.name
+                );
+            }
+            if job.env.contains_key(AGENT_TOKEN_ENV) {
+                bail!(
+                    "job {}: octotrigger sets {AGENT_TOKEN_ENV} itself",
+                    job.name
+                );
             }
             if job.agent.trim().is_empty() {
                 bail!("job {}: agent is the command that runs one task", job.name);
@@ -273,15 +316,68 @@ impl Config {
     }
 }
 
+/// The model plan that pays for the agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Plan {
+    /// A ChatGPT plan, through Hermes' `openai-codex` login.
+    ChatGpt,
+    /// A Claude plan, through the Hermes plugin
+    /// `claude-subscription-directsdk` and the Claude Code login.
+    Claude,
+}
+
+impl Plan {
+    /// The plan of a job command, from its `--provider`.
+    #[must_use]
+    pub fn of_command(agent: &str) -> Option<Self> {
+        if agent.contains("openai-codex") {
+            Some(Self::ChatGpt)
+        } else if agent.contains(CLAUDE_PROVIDER) {
+            Some(Self::Claude)
+        } else {
+            None
+        }
+    }
+
+    /// The Hermes command of a job on this plan.
+    #[must_use]
+    pub const fn agent_command(self) -> &'static str {
+        match self {
+            Self::ChatGpt => {
+                "hermes -z \"$(cat {prompt_file})\" --provider openai-codex -m gpt-6.1-terra\n\
+                 \x20     -t toolscaled,file --usage-file {usage_file}"
+            }
+            Self::Claude => {
+                "hermes -z \"$(cat {prompt_file})\"\n\
+                 \x20     --provider claude-subscription-directsdk-experimental -m 'claude-sonnet-5-5[1m]'\n\
+                 \x20     -t toolscaled,file --usage-file {usage_file}"
+            }
+        }
+    }
+
+    /// The API key that must not reach the agent, so the plan pays.
+    #[must_use]
+    pub const fn api_key(self) -> &'static str {
+        match self {
+            Self::ChatGpt => "OPENAI_API_KEY",
+            Self::Claude => "ANTHROPIC_API_KEY",
+        }
+    }
+}
+
+/// The Hermes provider of the Claude plugin.
+pub const CLAUDE_PROVIDER: &str = "claude-subscription-directsdk-experimental";
+
 /// The config `octotrigger setup` writes when there is none: one job with
-/// the Hermes command, for the person to change.
+/// the Hermes command of the plan, for the person to change.
 #[must_use]
-pub fn starter(machine: &str) -> String {
+pub fn starter(machine: &str, plan: Plan) -> String {
     format!(
         "# octotrigger config. The agent command runs one task and exits.\n\
          # {{prompt_file}}: the run's start prompt from Toolscaled, word for word.\n\
          # {{folder}}: the run's own empty folder. {{usage_file}}: where the agent\n\
-         # writes its token use. The agent uses its own Toolscaled connection.\n\
+         # writes its token use. The agent reaches Toolscaled on octotrigger's\n\
+         # sign-in: octotrigger puts a fresh token in {AGENT_TOKEN_ENV} for each run.\n\
          machine: {machine}\n\
          poll_seconds: 30\n\
          limits:\n\
@@ -294,10 +390,38 @@ pub fn starter(machine: &str) -> String {
          \x20   max_concurrent: 1\n\
          \x20   lease_seconds: 600\n\
          \x20   run_timeout_minutes: 20\n\
-         \x20   unset_env: [OPENAI_API_KEY]\n\
+         \x20   unset_env: [{api_key}]\n\
+         \x20   env:\n\
+         \x20     HERMES_HOME: ~/.config/octotrigger/hermes\n\
          \x20   agent: >-\n\
-         \x20     hermes -z \"$(cat {{prompt_file}})\" --provider openai-codex -m gpt-6.1-terra\n\
-         \x20     -t toolscaled,file --usage-file {{usage_file}}\n"
+         \x20     {command}\n",
+        api_key = plan.api_key(),
+        command = plan.agent_command(),
+    )
+}
+
+/// The `config.yaml` of octotrigger's Hermes home: the Toolscaled server
+/// with the token of the environment, no borrowed logins, no memory across
+/// runs.
+#[must_use]
+pub fn hermes_config(mcp_url: &str) -> String {
+    format!(
+        "# Written by octotrigger setup. The Hermes of the agents that octotrigger\n\
+         # starts. Your own Hermes (~/.hermes) is not changed.\n\
+         mcp_servers:\n\
+         \x20 toolscaled:\n\
+         \x20   url: {mcp_url}\n\
+         \x20   headers:\n\
+         \x20     Authorization: Bearer ${{{AGENT_TOKEN_ENV}}}\n\
+         \x20   enabled: true\n\
+         auth:\n\
+         \x20 # Only this home's own logins (hermes auth add): a login shared with\n\
+         \x20 # another program can log the two out.\n\
+         \x20 adopt_external_logins: false\n\
+         memory:\n\
+         \x20 # Nothing of one run reaches the next.\n\
+         \x20 memory_enabled: false\n\
+         \x20 user_profile_enabled: false\n"
     )
 }
 
@@ -307,25 +431,63 @@ mod tests {
 
     #[test]
     fn the_starter_config_reads_and_checks() {
-        let config: Config = serde_yaml::from_str(&starter("test-machine")).expect("reads");
-        config.check().expect("checks");
-        assert_eq!(config.jobs[0].workflows, Workflows::All);
-        assert_eq!(
-            config.runner_name(&config.jobs[0]),
-            "hermes on test-machine"
+        for plan in [Plan::ChatGpt, Plan::Claude] {
+            let config: Config =
+                serde_yaml::from_str(&starter("test-machine", plan)).expect("reads");
+            config.check().expect("checks");
+            let job = &config.jobs[0];
+            assert_eq!(job.workflows, Workflows::All);
+            assert_eq!(config.runner_name(job), "hermes on test-machine");
+            assert!(config.token_warning_confirmed.is_none());
+            assert_eq!(Plan::of_command(&job.agent), Some(plan));
+            assert_eq!(job.unset_env, [plan.api_key()]);
+            let env = job.env_values();
+            assert_eq!(env.len(), 1);
+            assert_eq!(env[0].0, "HERMES_HOME");
+            assert_eq!(env[0].1, hermes_home().display().to_string());
+            assert!(job.agent.contains("-t toolscaled,file"), "{}", job.agent);
+        }
+        assert!(
+            starter("m", Plan::Claude).contains("-m 'claude-sonnet-5-5[1m]'"),
+            "the Claude model is a full id"
         );
-        assert!(config.token_warning_confirmed.is_none());
     }
 
     #[test]
     fn a_job_with_repair_types_or_a_long_lease_is_refused() {
-        let base = starter("m");
+        let base = starter("m", Plan::ChatGpt);
         let repair = base.replace("types: [1, 2]", "types: [3]");
         let config: Config = serde_yaml::from_str(&repair).expect("reads");
         assert!(config.check().is_err());
         let long = base.replace("lease_seconds: 600", "lease_seconds: 5000");
         let config: Config = serde_yaml::from_str(&long).expect("reads");
         assert!(config.check().is_err());
+        let slow = base.replace("run_timeout_minutes: 20", "run_timeout_minutes: 51");
+        let config: Config = serde_yaml::from_str(&slow).expect("reads");
+        assert!(config.check().is_err(), "a run longer than its token");
+        let token = base.replace(
+            "HERMES_HOME: ~/.config/octotrigger/hermes",
+            "OCTOTRIGGER_TOOLSCALED_TOKEN: x",
+        );
+        let config: Config = serde_yaml::from_str(&token).expect("reads");
+        assert!(config.check().is_err(), "octotrigger sets the token itself");
+    }
+
+    #[test]
+    fn the_hermes_config_names_the_token_variable_and_no_token() {
+        let text = hermes_config("https://mcp.example/mcp");
+        let value: serde_yaml::Value = serde_yaml::from_str(&text).expect("yaml");
+        let server = &value["mcp_servers"]["toolscaled"];
+        assert_eq!(server["url"].as_str(), Some("https://mcp.example/mcp"));
+        assert_eq!(
+            server["headers"]["Authorization"].as_str(),
+            Some("Bearer ${OCTOTRIGGER_TOOLSCALED_TOKEN}")
+        );
+        assert_eq!(
+            value["auth"]["adopt_external_logins"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(value["memory"]["memory_enabled"].as_bool(), Some(false));
     }
 
     #[test]

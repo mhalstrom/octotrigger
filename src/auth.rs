@@ -1,8 +1,10 @@
 //! Sign-in to Toolscaled with OAuth: the authorization code flow with PKCE
-//! and a loopback address, as an MCP client signs in. octotrigger asks for
-//! the scope `agent_work` when the server offers it, and for the member's
-//! MCP scope until then. The tokens are kept in a file only the person can
-//! read; there is no API key to make or paste.
+//! and a loopback address, as an MCP client signs in, with the member's MCP
+//! scope for the Toolscaled MCP server. The one sign-in serves octotrigger's
+//! claim calls and the Toolscaled connection of the agents it starts: before
+//! each run octotrigger gives that run's agent a fresh access token. The
+//! tokens are kept in a file only the person can read; there is no API key
+//! to make or paste.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -16,10 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-/// The scope of the claim calls alone.
-pub const AGENT_WORK_SCOPE: &str = "agent_work";
-/// The member's MCP scope, which reaches the claim calls until the server
-/// offers `agent_work`.
+/// The member's MCP scope: the claim calls and the agent's MCP connection.
 pub const MCP_SCOPE: &str = "mcp:connect";
 
 /// What the auth file holds.
@@ -42,8 +41,6 @@ struct Metadata {
     authorization_endpoint: String,
     token_endpoint: String,
     registration_endpoint: String,
-    #[serde(default)]
-    scopes_supported: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,15 +95,7 @@ pub fn login(
         .call()
         .context("read the sign-in settings of Toolscaled")?
         .into_json()?;
-    let scope = if metadata
-        .scopes_supported
-        .iter()
-        .any(|s| s == AGENT_WORK_SCOPE)
-    {
-        AGENT_WORK_SCOPE
-    } else {
-        MCP_SCOPE
-    };
+    let scope = MCP_SCOPE;
 
     let server = tiny_http::Server::http("127.0.0.1:0")
         .map_err(|error| anyhow!("open a local address for the sign-in: {error}"))?;
@@ -323,8 +312,27 @@ pub fn load(path: &Path) -> Result<Tokens> {
 ///
 /// A refresh that the server refuses: the person signs in again.
 pub fn access_token(path: &Path, force: bool) -> Result<Tokens> {
+    fresh_for(path, if force { i64::MAX } else { 60 })
+}
+
+/// The access token with at least `seconds` left, refreshed when it ends
+/// sooner. The refresh token rotates, so one refresh at a time: a second
+/// octotrigger process (`octotrigger check` beside `start`) waits on the
+/// lock and then reads the new token instead of using the old refresh token.
+///
+/// # Errors
+///
+/// A refresh that the server refuses (the person signs in again), and a
+/// token that ends sooner than `seconds` even after a refresh.
+pub fn fresh_for(path: &Path, seconds: i64) -> Result<Tokens> {
+    let tokens = load(path)?;
+    if tokens.expires_at - now() > seconds {
+        return Ok(tokens);
+    }
+    let _lock = Lock::take(&path.with_extension("lock"))?;
+    // Another process may have refreshed while this one waited.
     let mut tokens = load(path)?;
-    if !force && tokens.expires_at - now() > 60 {
+    if seconds != i64::MAX && tokens.expires_at - now() > seconds {
         return Ok(tokens);
     }
     let answer: TokenAnswer = agent()
@@ -346,7 +354,48 @@ pub fn access_token(path: &Path, force: bool) -> Result<Tokens> {
     tokens.refresh_token = answer.refresh_token;
     tokens.expires_at = now() + answer.expires_in;
     save(path, &tokens)?;
+    if seconds != i64::MAX && tokens.expires_at - now() <= seconds {
+        bail!(
+            "the Toolscaled token lives {} seconds, less than the {seconds} a run needs",
+            answer.expires_in
+        );
+    }
     Ok(tokens)
+}
+
+/// An exclusive lock on a file, held until it is dropped.
+struct Lock(std::fs::File);
+
+impl Lock {
+    fn take(path: &Path) -> Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open the lock {}", path.display()))?;
+        set_mode(path, 0o600)?;
+        // SAFETY: flock takes the descriptor of a file this value owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            bail!(
+                "lock {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            );
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: as in take; the file stays open until after this call.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -406,5 +455,9 @@ mod tests {
         assert_eq!(folder_mode, 0o700);
         // A token with more than a minute left is not refreshed.
         assert_eq!(access_token(&path, false).expect("token").access_token, "a");
+        assert_eq!(fresh_for(&path, 1_500).expect("token").access_token, "a");
+        // One that ends sooner than a run needs is refreshed; this token
+        // endpoint does not answer, so the refresh fails.
+        assert!(fresh_for(&path, 7_200).is_err());
     }
 }

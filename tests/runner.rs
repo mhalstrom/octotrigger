@@ -28,6 +28,7 @@ struct Fake {
     renewed: Mutex<Vec<String>>,
     released: Mutex<Vec<Released>>,
     claim_ended: Mutex<bool>,
+    sign_in_ended: Mutex<bool>,
 }
 
 impl Surface for Fake {
@@ -69,6 +70,18 @@ impl Surface for Fake {
             usage: usage.cloned(),
         });
         Ok("finished".into())
+    }
+
+    fn agent_token(&self, seconds: i64) -> Result<String> {
+        assert_eq!(
+            seconds,
+            5 * 60 + 300,
+            "the run's time limit and five minutes"
+        );
+        if *self.sign_in_ended.lock().expect("lock") {
+            anyhow::bail!("the sign-in ended: run `octotrigger login` again");
+        }
+        Ok("agent-token".into())
     }
 }
 
@@ -131,14 +144,14 @@ fn a_claimed_run_starts_the_agent_and_ends_with_its_usage() {
     let dir = tempfile::tempdir().expect("dir");
     let fake = Arc::new(Fake::default());
     fake.waiting.lock().expect("lock").push_back(claim(1));
-    let agent = r#"cat {prompt_file} | grep -q "Nobody reads this chat" && echo "{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100,\"output_tokens\":7}}""#;
+    let agent = r#"test "$OCTOTRIGGER_TOOLSCALED_TOKEN" = agent-token && cat {prompt_file} | grep -q "Nobody reads this chat" && echo "{\"usage\":{\"input_tokens\":5,\"cache_read_input_tokens\":100,\"output_tokens\":7}}""#;
     let mut runner = runner(dir.path(), agent, "", &fake);
 
     runner.step().expect("step");
     assert_eq!(runner.running(), 1);
     let (workflows, name, lease) = fake.claims.lock().expect("lock")[0].clone();
     assert!(workflows.is_empty(), "a job of all workflows names none");
-    assert_eq!(name, "cat on test");
+    assert_eq!(name, "test on test");
     assert_eq!(lease, 60);
     assert_eq!(runner.state().claims.len(), 1);
 
@@ -320,4 +333,27 @@ fn no_start_before_the_token_warning_is_confirmed() {
         "{refused}"
     );
     assert!(fake.claims.lock().expect("lock").is_empty());
+}
+
+#[test]
+fn a_run_whose_agent_gets_no_token_ends_as_error_and_starts_nothing() {
+    let dir = tempfile::tempdir().expect("dir");
+    let fake = Arc::new(Fake::default());
+    *fake.sign_in_ended.lock().expect("lock") = true;
+    fake.waiting.lock().expect("lock").push_back(claim(9));
+    let marker = dir.path().join("started");
+    let mut runner = runner(
+        dir.path(),
+        &format!("touch {}", marker.display()),
+        "",
+        &fake,
+    );
+    runner.step().expect("step");
+    assert_eq!(runner.running(), 0);
+    let released = fake.released.lock().expect("lock").clone();
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0].outcome, Outcome::Error);
+    let note = released[0].note.clone().unwrap_or_default();
+    assert!(note.contains("octotrigger login"), "{note}");
+    assert!(!marker.exists(), "no agent started");
 }

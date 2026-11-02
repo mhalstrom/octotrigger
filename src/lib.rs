@@ -6,6 +6,7 @@ pub mod auth;
 pub mod config;
 pub mod log;
 pub mod runner;
+pub mod setup;
 pub mod state;
 pub mod surface;
 

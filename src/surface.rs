@@ -1,5 +1,6 @@
 //! The three claim calls of Toolscaled's `/surface`: claim a run, keep the
-//! claim, end it. octotrigger calls nothing else on `/surface`.
+//! claim, end it. octotrigger calls nothing else on `/surface`. The same
+//! sign-in gives each run's agent its Toolscaled token.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -111,6 +112,12 @@ pub trait Surface: Send + Sync {
         note: Option<&str>,
         usage: Option<&Usage>,
     ) -> Result<String>;
+    /// The access token for one run's agent, with at least `seconds` left.
+    ///
+    /// # Errors
+    ///
+    /// A sign-in that ended, or a token that cannot live that long.
+    fn agent_token(&self, seconds: i64) -> Result<String>;
 }
 
 /// The HTTP form of [`Surface`], with the sign-in of the auth file.
@@ -227,6 +234,10 @@ impl Surface for HttpSurface {
         let answer = self.call("release_agent_work", body)?;
         Ok(answer["run"].as_str().unwrap_or_default().to_owned())
     }
+
+    fn agent_token(&self, seconds: i64) -> Result<String> {
+        Ok(crate::auth::fresh_for(&self.auth_file, seconds)?.access_token)
+    }
 }
 
 impl<T: Surface + ?Sized> Surface for std::sync::Arc<T> {
@@ -251,5 +262,9 @@ impl<T: Surface + ?Sized> Surface for std::sync::Arc<T> {
         usage: Option<&Usage>,
     ) -> Result<String> {
         (**self).release(claim_token, outcome, note, usage)
+    }
+
+    fn agent_token(&self, seconds: i64) -> Result<String> {
+        (**self).agent_token(seconds)
     }
 }

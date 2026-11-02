@@ -2,8 +2,11 @@
 //! start prompt in it, the command in its own process group, and its token
 //! use when it ends.
 //!
-//! The agent reaches Toolscaled through its own Toolscaled connection, which
-//! the person set up once; octotrigger gives it no credential.
+//! The agent reaches Toolscaled on octotrigger's own sign-in: octotrigger
+//! puts a fresh access token in the agent's environment
+//! ([`AGENT_TOKEN_ENV`]), and the agent's MCP config names that variable.
+//! The token is in no file of the run's folder and in no log line, and the
+//! person's own chats keep their own Toolscaled connection.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -14,7 +17,7 @@ use std::process::{Child, Command, Stdio};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::Job;
+use crate::config::{AGENT_TOKEN_ENV, Job};
 use crate::surface::{Claim, Usage};
 
 /// The files of a run's folder.
@@ -65,12 +68,13 @@ fn quote(path: &Path) -> String {
 }
 
 /// Starts the agent in the run's folder, in a process group of its own, with
-/// its output in `output`.
+/// its output in `output`, the job's `env`, and `token` as its Toolscaled
+/// access token.
 ///
 /// # Errors
 ///
 /// A command that cannot start.
-pub fn spawn(job: &Job, folder: &Folder, output: &Path) -> Result<Child> {
+pub fn spawn(job: &Job, folder: &Folder, output: &Path, token: &str) -> Result<Child> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -87,6 +91,8 @@ pub fn spawn(job: &Job, folder: &Folder, output: &Path) -> Result<Child> {
     for name in &job.unset_env {
         command.env_remove(name);
     }
+    command.envs(job.env_values());
+    command.env(AGENT_TOKEN_ENV, token);
     command
         .spawn()
         .with_context(|| format!("start the agent of job {}", job.name))
@@ -224,12 +230,16 @@ mod tests {
     fn the_agent_runs_in_its_folder_without_the_unset_names() {
         let work = tempfile::tempdir().expect("work");
         let folder = prepare(work.path(), &claim()).expect("folder");
-        let mut job = job("pwd; echo key=${OCTO_TEST_KEY:-none}");
+        let mut job = job(
+            "pwd; echo key=${OCTO_TEST_KEY:-none} home=$OCTO_TEST_HOME token=$OCTOTRIGGER_TOOLSCALED_TOKEN",
+        );
         job.unset_env = vec!["OCTO_TEST_KEY".into()];
+        job.env
+            .insert("OCTO_TEST_HOME".into(), "~/agent-home".into());
         // SAFETY: the test sets a name only it reads.
         unsafe { std::env::set_var("OCTO_TEST_KEY", "secret") };
         let output = work.path().join("out.log");
-        let status = spawn(&job, &folder, &output)
+        let status = spawn(&job, &folder, &output, "run-token")
             .expect("spawn")
             .wait()
             .expect("wait");
@@ -237,6 +247,14 @@ mod tests {
         let text = std::fs::read_to_string(&output).expect("output");
         assert!(text.contains("run-r1"), "{text}");
         assert!(text.contains("key=none"), "{text}");
+        let home = crate::config::home().join("agent-home");
+        assert!(text.contains(&format!("home={}", home.display())), "{text}");
+        assert!(text.contains("token=run-token"), "{text}");
+        let names: Vec<_> = std::fs::read_dir(&folder.path)
+            .expect("folder")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, ["prompt.txt"], "no token file in the run's folder");
     }
 
     #[test]

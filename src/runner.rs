@@ -6,9 +6,10 @@
 //!    done; `now` stops them and ends their claims.
 //! 3. With a free slot and the day's limits left: one claim call for all
 //!    jobs with a free slot.
-//! 4. A claim: the run's folder, the agent in its own process group with the
-//!    job's time limit, the claim in the state file, a renew every third of
-//!    the lease.
+//! 4. A claim: the run's folder, a fresh Toolscaled token for the agent that
+//!    outlives the job's time limit, the agent in its own process group with
+//!    that limit, the claim in the state file, a renew every third of the
+//!    lease.
 //! 5. An agent that ends: its token use is read and counted, the claim is
 //!    ended (`done` when it exited 0, else `error`) with the use, and the
 //!    folder is deleted.
@@ -408,8 +409,13 @@ impl<S: Surface> Runner<S> {
         let job: Job = self.config.jobs[job_index].clone();
         let work_dir = expand(&self.config.work_dir);
         let output = self.log.run_output(&claim.run_id);
-        let started = agent::prepare(&work_dir, &claim)
-            .and_then(|folder| agent::spawn(&job, &folder, &output).map(|child| (folder, child)));
+        // The token must outlive the run, with five minutes to spare.
+        let token_seconds = i64::try_from(job.run_timeout_minutes * 60 + 300).unwrap_or(i64::MAX);
+        let started = self.surface.agent_token(token_seconds).and_then(|token| {
+            agent::prepare(&work_dir, &claim).and_then(|folder| {
+                agent::spawn(&job, &folder, &output, &token).map(|child| (folder, child))
+            })
+        });
         let (folder, child) = match started {
             Ok(pair) => pair,
             Err(error) => {
